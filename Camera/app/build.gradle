@@ -1,0 +1,56 @@
+apply plugin: 'com.android.application'
+
+android {
+    compileSdkVersion 15
+    buildToolsVersion '26.0.2'
+
+    defaultConfig {
+        applicationId "io.github.bi2qfa.alphasync"
+        minSdkVersion 10
+        targetSdkVersion 10
+        versionCode 1
+        versionName "1.0"
+    }
+
+    sourceCompatibility = JavaVersion.VERSION_1_6
+    targetCompatibility = JavaVersion.VERSION_1_6
+
+    // 不压缩 png，保证换装素材 1:1 进包（9-patch 的 marker 边框一个字节都不能被动）
+    aaptOptions {
+        cruncherEnabled = false
+    }
+
+    packagingOptions {
+        // 编译桩绝不进 APK（真机用框架里的真实类解析）
+        exclude 'com/sony/**'
+    }
+
+    signingConfigs {
+        // ★ AlphaSync 签名（双端共用 keys/AlphaSync.jks；口令在 keys/signing.properties，不入 git）。
+        //   相机平台只认 v1（JAR）签名：带 v2 签名块的包会在 Installing 阶段被拒
+        //   （PMCA 报 "Communication error 100: Error completed"；2026-09-25 实测：
+        //   相机 flash 的 app 分区转储里 21 个已安装应用全部 v1-only）。
+        //   AGP 默认给 debug 包加 v2 块，这里显式关掉。
+        alphasync {
+            def signProps = new Properties()
+            def signFile = rootProject.file('../keys/signing.properties')
+            if (signFile.exists()) { signFile.withInputStream { signProps.load(it) } }
+            storeFile rootProject.file('../keys/' + (signProps['storeFile'] ?: 'AlphaSync.jks'))
+            storePassword signProps['storePassword']
+            keyAlias signProps['keyAlias']
+            keyPassword signProps['keyPassword']
+            v1SigningEnabled true
+            v2SigningEnabled false
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.alphasync
+        }
+    }
+}
+
+dependencies {
+    compileOnly files('libs/stubs.jar')
+}

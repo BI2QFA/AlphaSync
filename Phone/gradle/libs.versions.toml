@@ -1,0 +1,30 @@
+[versions]
+agp = "9.2.1"
+kotlinComposeCompiler = "2.2.20"
+# ★ Compose 走**稳定通道 BOM**（`compose-bom`，2026.09.00 稳定线），material3 另行
+#   **显式 pin 1.5.0-alpha28**（覆盖 BOM）—— MD3E 的那套 API（MaterialExpressiveTheme /
+#   MotionScheme.expressive() / ListItem 的 segmentedShapes / ButtonGroup /
+#   LoadingIndicator / MaterialShapes）在稳定线里是 Kotlin internal，只有 1.5.0-alpha 公开。
+#   验证门：构建通过 + 装机冒烟；若运行期不兼容则回退 alpha BOM（Q6/Q7 口径）。
+composeBom = "2026.09.00"
+composeMaterial3 = "1.5.0-alpha28"
+activityCompose = "1.13.0"
+coreKtx = "1.19.0"
+lifecycleRuntime = "2.9.4"
+junit = "4.13.2"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-lifecycle-runtime = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntime" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+compose-ui = { group = "androidx.compose.ui", name = "ui" }
+compose-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3", version.ref = "composeMaterial3" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlinComposeCompiler" }

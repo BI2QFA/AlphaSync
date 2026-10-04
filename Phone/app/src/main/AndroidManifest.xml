@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- ★ Android 16 Live Updates（实时更新）：传输进度通知请求"提升为常驻进度通知"
+         用的**非运行时权限**（清单声明即可；用户可在系统设置里逐应用关闭）。 -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <!-- 无定位权限：扫描用子网探测，不读 SSID；扫码功能已移除，无相机权限 -->
+
+    <!-- 预测性返回：opt-in。开了之后系统退到"按返回键那一刻就能预览上一个界面"。
+         本应用的返回全走 Compose 的 BackHandler（activity-compose 1.13 会把它们注册到
+         OnBackInvokedDispatcher），所以开它是纯增益；万一某台设备上返回行为异常，
+         删掉 enableOnBackInvokedCallback 这一行就能回到老路径。 -->
+    <application
+        android:name=".AlphaSyncApp"
+        android:allowBackup="true"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AlphaSync">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".transfer.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 连接保活：连接期间常驻前台，防 MIUI 后台冻结/限网导致断连 -->
+        <service
+            android:name=".core.ConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 传输页点开已完成文件（应用目录通道走 FileProvider）。
+             ★ authority 必须与代码里 `context.packageName + ".files"`（StorageSinks）取到的
+               值一致：写死旧包名会在改包名后失配 —— 表现为"点开已传输文件"静默失败
+               （getUriForFile 抛 IllegalArgumentException，被 runCatching 吞掉）。
+               用 ${applicationId} 占位符：包名再变也不失配，也不会与旧包名冲突安装。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

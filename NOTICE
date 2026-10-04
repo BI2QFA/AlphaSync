@@ -1,0 +1,30 @@
+AlphaSync
+Copyright (c) 2026 BI2QFA
+
+许可说明 / License notices
+==========================
+
+1. 源代码（Camera/ 与 Phone/ 下的全部源码）采用 MIT 许可证，全文见 LICENSE。
+
+2. 图标资源（应用启动图标、界面图标与图标字体，如 ms_icons*.ttf）
+   采用 Apache License, Version 2.0，全文见 LICENSES/Apache-2.0.txt。
+
+   其中部分图标字形取自 Google Material Symbols
+   （https://fonts.google.com/icons），
+   Copyright Google LLC，按 Apache License 2.0 授权使用。
+
+   再分发本项目的图标资源时，请保留本声明，并随附 Apache License 2.0 全文。
+
+------------------------------------------------------------------------
+
+1. Source code under Camera/ and Phone/ is licensed under the MIT License
+   (see LICENSE).
+
+2. Icon assets (launcher icons, UI icons and icon fonts such as
+   ms_icons*.ttf) are licensed under the Apache License, Version 2.0
+   (see LICENSES/Apache-2.0.txt). Portions of the glyphs are derived from
+   Google Material Symbols (https://fonts.google.com/icons),
+   Copyright Google LLC, licensed under the Apache License, Version 2.0.
+
+   Redistributions of the icon assets must retain this notice and include
+   the full Apache License 2.0 text.

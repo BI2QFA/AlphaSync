@@ -1,0 +1,43 @@
+# 构建产物 Build output
+build/
+*.class
+
+# Gradle 本机配置 Gradle local config
+.gradle/
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.kotlin/
+
+# 安装包：本仓库不收录 APK/AAB Install packages are not tracked
+*.apk
+*.aab
+
+# 日志与系统文件 Logs & OS files
+*.log
+.DS_Store
+Thumbs.db
+
+# 相机端原生构建产物 Camera native build outputs
+native/ndk-out/
+native/ndk-libs/
+Camera/native/ndk-out/
+Camera/native/ndk-libs/
+
+# 工具缓存 Tool caches
+__pycache__/
+*.pyc
+
+# 会话/工作区数据 Workspace session data
+.workbuddy/
+
+# 签名密钥绝不入仓 Signing material must never be committed
+*.jks
+*.keystore
+signing.properties
+keys/
