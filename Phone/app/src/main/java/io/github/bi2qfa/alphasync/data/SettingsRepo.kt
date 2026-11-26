@@ -69,6 +69,14 @@ object SettingsRepo {
     }
     var tonalBlockLevels by mutableIntStateOf(4)
         private set
+
+    internal var tonalBlockMode by mutableStateOf(TonalBlocks.Mode.FIXED_BRIGHTNESS)
+        private set
+
+    internal fun updateTonalBlockMode(mode: TonalBlocks.Mode) {
+        tonalBlockMode = mode
+        prefs.edit().putString("tonalBlockMode", mode.name).apply()
+    }
     fun updateTonalBlockLevels(levels: Int) {
         tonalBlockLevels = TonalBlocks.validLevels(levels)
         prefs.edit().putInt("tonalBlockLevels", tonalBlockLevels).apply()
@@ -132,6 +140,9 @@ object SettingsRepo {
         zebraThreshold = ZebraHighlight.validThreshold(prefs.getInt("zebraThreshold", 95))
         zebraEnabled = prefs.getBoolean("zebraEnabled", false)
         tonalBlockLevels = TonalBlocks.validLevels(prefs.getInt("tonalBlockLevels", 4))
+        val savedTonalMode = prefs.getString("tonalBlockMode", null)
+        tonalBlockMode = TonalBlocks.Mode.entries.firstOrNull { it.name == savedTonalMode }
+            ?: TonalBlocks.Mode.FIXED_BRIGHTNESS
         tonalBlocksEnabled = prefs.getBoolean("tonalBlocksEnabled", false)
         histogramVisible = prefs.getBoolean("histogramVisible", false)
         histogramRgb = prefs.getBoolean("histogramRgb", false)

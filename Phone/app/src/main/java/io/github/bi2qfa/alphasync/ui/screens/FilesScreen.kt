@@ -53,6 +53,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import io.github.bi2qfa.alphasync.ui.components.ViewportPreviews
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -163,6 +164,7 @@ fun FilesScreen(
     onSwitchDevice: (String) -> Unit = {},
     /** ★ 2.11：双击顶栏标题 → 回列表顶部（MainActivity 递增的信号；0/未变不动）。 */
     topTick: Int = 0,
+    refreshTick: Int = 0,
 ) {
     val context = LocalContext.current
     val host = ConnectionCenter.host
@@ -338,6 +340,7 @@ fun FilesScreen(
     val queueItems = TransferStore.items
 
     // ★ 第三批（§4）：非选择模式长按 = 弹"下载"确认框（针对该单个文件；文件夹无操作）
+    var showDownloadOptions by remember { mutableStateOf(false) }
     var downloadTarget by remember { mutableStateOf<ObjectRepository.FtpEntry?>(null) }
 
     var preparing by remember { mutableStateOf(false) }
@@ -568,7 +571,7 @@ fun FilesScreen(
         }
     }
 
-    LaunchedEffect(dir, host) { load(dir) }
+    LaunchedEffect(dir, host, refreshTick) { load(dir) }
 
     /**
      * ★ 2.8：**停留期间自动刷新**——后台运行时代的旧前提"软件运行时 SD 卡内的
@@ -708,7 +711,11 @@ fun FilesScreen(
      * ★ 第三批（§4）：[targets] = 指定条目名单（非选择模式长按单文件"下载"）——
      * null 时走当前选择集合（原行为不变）；点下载不进入选择模式、不清现有选择。
      */
-    fun startTransfer(targets: List<ObjectRepository.FtpEntry>? = null) {
+    fun startTransfer(
+        targets: List<ObjectRepository.FtpEntry>? = null,
+        priority: Boolean = false,
+        fromPreview: Boolean = false,
+    ) {
         if (preparing || host == null) return
         val activeHost = host
         preparing = true
@@ -731,7 +738,7 @@ fun FilesScreen(
             // ★ 第三批（§4）：targets（长按单文件）优先；否则选择集合（原行为）。
             val entriesSnapshot = targets ?: shownEntries.toList()
             val selectedSnapshot = targets?.map { it.path } ?: selected.toList()
-            val formatSnapshot = fileFormat
+            val formatSnapshot = if (fromPreview) FileFormatFilter.All else fileFormat
             try {
                 // ★ 网络扫描必须离开主线程：listPage() 是同步阻塞调用（内部在
                 //   ioExecutor 上等结果），选中含子目录的条目时这里会在主线程跑
@@ -748,7 +755,7 @@ fun FilesScreen(
                             val items = batch.map {
                                 TransferItem(
                                     id = it.path, name = it.name, path = it.path,
-                                    size = it.size, mtime = it.timestamp,
+                                    size = it.size, mtime = it.timestamp, priorityDownload = priority,
                                 )
                             }
                             // 入队改的是 Compose 状态 → 回到主线程写
@@ -767,9 +774,15 @@ fun FilesScreen(
                 scanProgress = ""
                 if (ConnectionCenter.host != null) {
                     DownloadService.start(context)
-                    selecting = false
-                    selected.clear()
-                    onGoTransfers()
+                    if (fromPreview) {
+                        android.widget.Toast.makeText(context,
+                            if (priority) "已加入优先下载队列" else "已加入下载队列",
+                            android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        selecting = false
+                        selected.clear()
+                        onGoTransfers()
+                    }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // 取消：已经分批入队的任务保留，尚未入队的丢弃。
@@ -1101,6 +1114,7 @@ fun FilesScreen(
                 val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState(
                     initialFirstVisibleItemIndex = FileListCache.get(guid, dir)?.gridScroll ?: 0,
                 )
+                ViewportPreviews(displayEntries) { gridState.layoutInfo.visibleItemsInfo.map { it.index } }
                 // 滚动位置持续回写（每个目录一层，互不覆盖 —— "记住每一层级"）；
                 // ★ 2.11 §2：顺带维护"在不在两端"—— 自动露出只在用户停在那端时触发
                 //   （totalItemsCount 是布局状态，列表增减也会让本流重新发射）。
@@ -1198,6 +1212,7 @@ fun FilesScreen(
                 val listState = androidx.compose.foundation.lazy.rememberLazyListState(
                     initialFirstVisibleItemIndex = FileListCache.get(guid, dir)?.listScroll ?: 0,
                 )
+                ViewportPreviews(displayEntries) { listState.layoutInfo.visibleItemsInfo.map { it.index } }
                 // 滚动位置持续回写（列表模式自己的字段）；★ 2.11 §2 同网格分支维护两端状态
                 LaunchedEffect(dir, guid) {
                     snapshotFlow {
@@ -1336,7 +1351,7 @@ fun FilesScreen(
                         preparing = false
                         scanProgress = ""
                     } else {
-                        startTransfer()
+                        showDownloadOptions = true
                     }
                 }) {
                     if (preparing) {
@@ -1390,27 +1405,38 @@ fun FilesScreen(
                 onDismiss = { fullscreenEntry = null },
                 onOpenSettings = onOpenSettings,
                 onSwitchDevice = onSwitchDevice,
+                onDownload = { photo, priority ->
+                    startTransfer(listOf(photo), priority, fromPreview = true)
+                },
             )
         }
     }
 
     // ★ 第三批（§4）：非选择模式长按文件 → "下载"确认框。点"下载"直接把该条目
     //   点名进扫描队列（targets），不进入选择模式、不清现有选择；文件夹不弹（§10 Q4）。
-    downloadTarget?.let { entry ->
+    if (downloadTarget != null || showDownloadOptions) {
+        fun closeOptions() { downloadTarget = null; showDownloadOptions = false }
         AlertDialog(
-            onDismissRequest = { downloadTarget = null },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = { Text("下载") },
-            text = { Text("下载 ${entry.name}？") },
-            confirmButton = {
-                TextButton(onClick = {
-                    downloadTarget = null
-                    startTransfer(targets = listOf(entry))
-                }) { Text("下载") }
+            onDismissRequest = { closeOptions() },
+            title = { Text("下载方式") },
+            text = {
+                Column {
+                    Text(downloadTarget?.name ?: "已选择 ${selected.size} 项")
+                    Text("优先下载先于普通任务执行；正常下载按入队顺序执行，并为当前预览让路。")
+                    TextButton(onClick = {
+                        val targets = downloadTarget?.let { listOf(it) }
+                        closeOptions()
+                        startTransfer(targets, priority = true)
+                    }) { Text("优先下载") }
+                    TextButton(onClick = {
+                        val targets = downloadTarget?.let { listOf(it) }
+                        closeOptions()
+                        startTransfer(targets, priority = false)
+                    }) { Text("正常下载") }
+                }
             },
-            dismissButton = {
-                TextButton(onClick = { downloadTarget = null }) { Text("取消") }
-            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { closeOptions() }) { Text("取消") } },
         )
     }
 

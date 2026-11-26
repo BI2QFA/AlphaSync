@@ -452,6 +452,7 @@ public class MainActivity extends Activity {
     // wipeModeAndRechoose() 一起拿掉，不留半截功能。改连接方式的入口在"连接设置"里。
     private final String[][] menuItems = {
             {"连接设置", "未设置", ACT_MODE},
+            {"遥控拍摄", "", "webcontrol"},
             {"关于", "", ACT_ABOUT},
             {"退出应用程序", "", ACT_EXIT},
     };
@@ -471,6 +472,7 @@ public class MainActivity extends Activity {
      */
     private final String[][] menuItemsPairingMode = {
             {"连接设置", "未设置", ACT_MODE},
+            {"遥控拍摄", "", "webcontrol"},
             {"关于", "", ACT_ABOUT},
             {"退出应用程序", "", ACT_EXIT},
     };
@@ -507,6 +509,17 @@ public class MainActivity extends Activity {
             requestPairing();
         } else if (ACT_PAIRED.equals(act)) {
             showScreen(SCR_PAIRED);
+        } else if ("webcontrol".equals(act)) {
+            // Keep the existing network/PTP services alive while the child owns CameraEx.
+            jumpingToSystem = true;
+            if (thumbPrefetcher != null) thumbPrefetcher.pauseForRemote();
+            try {
+                startActivity(new Intent(this, com.sony.pmca.webcontrol.MacroServerActivity.class));
+            } catch (Throwable t) {
+                jumpingToSystem = false;
+                if (thumbPrefetcher != null) thumbPrefetcher.resumeFromRemote();
+                AppLog.w("Remote", "无法打开遥控：" + t);
+            }
         } else if (ACT_ABOUT.equals(act)) {
             showScreen(SCR_ABOUT);
         } else if (ACT_BACKGROUND.equals(act)) {
@@ -1097,6 +1110,7 @@ public class MainActivity extends Activity {
             }
         }
         jumpingToSystem = false;
+        if (thumbPrefetcher != null) thumbPrefetcher.resumeFromRemote();
         if (shuttingDown) return;
         if (isAirplaneModeOn()) {
             daFinishOnly();
@@ -1434,7 +1448,7 @@ public class MainActivity extends Activity {
             case ScalarInput.ISV_KEY_EV_COMPENSATION: return "曝光补偿转盘";
             case ScalarInput.ISV_KEY_IRIS_DIAL: return "光圈转盘";
             case ScalarInput.ISV_KEY_UNKNOWN: return "UNKNOWN";
-            case ScalarInput.KEY_NOT_SUPPORTED: return "NOT_SUPPORTED";
+            case -1: return "NOT_SUPPORTED"; // KEY_NOT_SUPPORTED in AlphaSync's original stub.
             default: return "0x" + Integer.toHexString(scan);
         }
     }

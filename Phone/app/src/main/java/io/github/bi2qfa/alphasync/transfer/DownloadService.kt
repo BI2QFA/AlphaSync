@@ -267,12 +267,14 @@ class DownloadService : Service() {
                 stopAll = true
                 break
             }
-            val next = q.items.firstOrNull { it.state == TransferState.QUEUED }
+            val next = TransferStore.nextQueued(q)
                 ?: break
             var item = next.copy(state = TransferState.RUNNING)
             TransferStore.update(q, item)
             TransferStore.updateBatchProgress(q)
 
+            fun preempted() = TransferStore.shouldPreempt(q, item)
+            var prioritySwitch = false
             var attempt = 0
             var result: ObjectRepository.PumpResult = ObjectRepository.PumpResult.FAILED
             var failureReason = ""
@@ -357,11 +359,16 @@ class DownloadService : Service() {
                 result = try {
                     ObjectRepository.pumpToStream(
                         h, item.path, base, out,
-                        cancelled = { stopAll || currentDeviceKey() != boundGuid },
+                        cancelled = { stopAll || currentDeviceKey() != boundGuid || prioritySwitch },
                         withSegment = { segment ->
-                            ThumbStore.withDownloadSegment(segment) { stopAll || currentDeviceKey() != boundGuid }
+                            // Switch only before a segment or while waiting for previews;
+                            // never truncate a live original-file data channel just to reorder.
+                            ThumbStore.withDownloadSegment(segment, priority = { TransferStore.isPriority(q, item.id) }) {
+                                if (preempted()) prioritySwitch = true
+                                stopAll || currentDeviceKey() != boundGuid || prioritySwitch
+                            }
                         },
-                        yieldForPreview = { ThumbStore.previewsNeedChannel() },
+                        yieldForPreview = { !TransferStore.isPriority(q, item.id) && ThumbStore.previewsNeedChannel() },
                         // 回调值已是绝对字节数（REST 基址 + 已传），切勿再加 base
                         // —— 加第二次就是"续传后 39.8MB/23.9MB"超量显示的根源
                         onProgress = { total ->
@@ -400,7 +407,7 @@ class DownloadService : Service() {
             val doneItem = item.copy(
                 state = when {
                     result == ObjectRepository.PumpResult.COMPLETED -> TransferState.DONE
-                    stopAll -> TransferState.QUEUED // 停止=整批暂停，进度保留
+                    stopAll || (result == ObjectRepository.PumpResult.CANCELLED && prioritySwitch) -> TransferState.QUEUED // Pause preserves partial bytes.
                     else -> TransferState.FAILED
                 },
                 doneBytes = lastTotal,

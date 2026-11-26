@@ -5,12 +5,19 @@ import org.junit.Test
 
 class TonalBlocksTest {
     @Test fun allSupportedModesHaveExactNumberOfMonotonicLevels() {
-        for (levels in TonalBlocks.supportedLevels) {
-            val output = (0..255).map { TonalBlocks.map(gray(it), levels) and 255 }
+        for (mode in TonalBlocks.Mode.entries) for (levels in TonalBlocks.supportedLevels) {
+            val output = (0..255).map { TonalBlocks.map(gray(it), levels, mode) and 255 }
             assertEquals(levels, output.toSet().size)
             assertEquals(0, output.first()); assertEquals(255, output.last())
             assertTrue(output.zipWithNext().all { (a, b) -> a <= b })
         }
+    }
+    @Test fun cieModeUsesLinearLuminanceAndPerceptualGrayOutput() {
+        val mode = TonalBlocks.Mode.CIE_LIGHTNESS
+        assertEquals(gray(162), TonalBlocks.map(0xffff0000.toInt(), 4, mode))
+        assertEquals(gray(255), TonalBlocks.map(0xff00ff00.toInt(), 4, mode))
+        assertEquals(gray(78), TonalBlocks.map(0xff0000ff.toInt(), 4, mode))
+        assertEquals(0x80ffffff.toInt(), TonalBlocks.map(0x80ffffff.toInt(), 4, mode))
     }
     @Test fun invalidSavedLevelsFallBackToFour() {
         assertEquals(4, TonalBlocks.validLevels(0))

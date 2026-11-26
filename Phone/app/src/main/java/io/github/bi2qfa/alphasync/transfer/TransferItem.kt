@@ -30,6 +30,7 @@ data class TransferItem(
      */
     val deviceDir: String = "",
     val error: String = "",
+    val priorityDownload: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("id", id)
@@ -41,6 +42,7 @@ data class TransferItem(
         .put("mtime", mtime)
         .put("dir", deviceDir)
         .put("error", error)
+        .put("priorityDownload", priorityDownload)
 
     companion object {
         fun fromJson(o: JSONObject): TransferItem = TransferItem(
@@ -54,6 +56,7 @@ data class TransferItem(
             mtime = o.optLong("mtime"),
             deviceDir = o.optString("dir"),
             error = o.optString("error"),
+            priorityDownload = o.optBoolean("priorityDownload", false),
         )
     }
 }

@@ -24,8 +24,8 @@ android {
         // AlphaSync 1.0（vc 1，双端同步）：功能集 = 改名前的 2.12 代（倒序分页、
         //   小图 EXIF 随传捆绑包、PING JSON 实时包等）。**零兼容**：不与任何老版本
         //   互通（协议已无回退分支），两端必须一起装。
-        versionCode = 34
-        versionName = "1.0-direct.34"
+        versionCode = 44
+        versionName = "1.0-direct.44"
     }
 
     signingConfigs {

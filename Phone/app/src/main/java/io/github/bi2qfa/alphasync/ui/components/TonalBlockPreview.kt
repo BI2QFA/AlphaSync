@@ -9,7 +9,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
 /** Read row by row to avoid a second full-sized pixel array; preserve preview resolution. */
-internal suspend fun tonalBlockPreview(image: ImageBitmap, levels: Int): ImageBitmap {
+internal suspend fun tonalBlockPreview(image: ImageBitmap, levels: Int, mode: TonalBlocks.Mode): ImageBitmap {
     val source = image.asAndroidBitmap()
     val output = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
     val row = IntArray(source.width)
@@ -17,7 +17,7 @@ internal suspend fun tonalBlockPreview(image: ImageBitmap, levels: Int): ImageBi
         for (y in 0 until source.height) {
             currentCoroutineContext().ensureActive()
             source.getPixels(row, 0, source.width, 0, y, source.width, 1)
-            for (x in row.indices) row[x] = TonalBlocks.map(row[x], levels)
+            for (x in row.indices) row[x] = TonalBlocks.map(row[x], levels, mode)
             output.setPixels(row, 0, source.width, 0, y, source.width, 1)
         }
         return output.asImageBitmap()

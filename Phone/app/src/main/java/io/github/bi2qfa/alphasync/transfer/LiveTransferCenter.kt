@@ -731,21 +731,21 @@ object LiveTransferCenter {
      * <p>流程（主线程）：摘出待发池 → 入队（幂等）→ 提头 + 收回 QUEUED（磁盘
      * `.part` 原样，断点天然保留）→ 打断旧批次、等其退出后从队头起跑。
      */
-    fun startNow(entries: List<ObjectRepository.FtpEntry>) {
+    fun startNow(entries: List<ObjectRepository.FtpEntry>, priority: Boolean = false) {
         if (entries.isEmpty()) return
         val ctx = appContext ?: return
         val guid = sessionGuid ?: ConnectionCenter.camera?.guidHex ?: return
         val q = TransferStore.queueFor(guid)
         val wanted = entries.map {
-            TransferItem(id = it.path, name = it.name, path = it.path, size = it.size, mtime = it.timestamp)
+            TransferItem(id = it.path, name = it.name, path = it.path, size = it.size, mtime = it.timestamp, priorityDownload = priority)
         }
         // 摘出待发池（身份精确匹配：同 path 重拍不算同一条）——避免它们再走正常补位
         pendingEnqueue.removeAll { pool ->
             entries.any { it.path == pool.path && it.size == pool.size && it.timestamp == pool.timestamp }
         }
         TransferStore.enqueueBatch(q, wanted)   // 幂等：已入队原位刷新，不产生重复条目
-        TransferStore.prioritize(q, wanted)     // 提头 + 收回 QUEUED
-        interruptAndRestart(ctx, guid)          // 打断 + 等旧线程退出后从队头起跑
+        // The shared scheduler handles priority at safe transfer boundaries.
+        DownloadService.start(ctx)
     }
 
     /**

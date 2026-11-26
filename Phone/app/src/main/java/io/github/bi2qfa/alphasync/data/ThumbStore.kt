@@ -284,6 +284,10 @@ object ThumbStore {
     private val latestPriority = LivePreviewPriority<ObjectCacheKey> { it.token }
     private val directoryPriority = LivePreviewPriority<ObjectCacheKey> { it.token }
     private var focusedDirectory = "/"
+    private val visiblePriority = LivePreviewPriority<ObjectCacheKey> { it.token }
+    private var visibleOwner: Any? = null
+    private var visibleKeys: List<ObjectCacheKey> = emptyList()
+    private var visibleDevice: String? = null
     private val livePriority = LivePreviewPriority<ObjectCacheKey> { it.token }
     private val previewQueue = ArrayDeque<ObjectCacheKey>()    // 阶段 B：大预览
     private val thumbQueuedSet = HashSet<String>()             // 去重（token）
@@ -657,6 +661,7 @@ object ThumbStore {
 
     // ===== 传输暂停联动 =====
 
+    @Volatile var remoteControlActive = false
     @Volatile private var automaticHasWork = false
     var downloadWaitingForPreview by mutableStateOf(false)
         private set
@@ -664,17 +669,18 @@ object ThumbStore {
     fun previewsNeedChannel(): Boolean = synchronized(lock) {
         PreviewChannelPolicy.shouldYield(
             foreground = bulkGate.foregroundPending,
-            urgentQueued = livePriority.hasQueued(thumbQueuedSet) || livePriority.hasQueued(previewQueuedSet),
+            urgentQueued = livePriority.hasQueued(thumbQueuedSet) || livePriority.hasQueued(previewQueuedSet) ||
+                visiblePriority.hasQueued(thumbQueuedSet) || visiblePriority.hasQueued(previewQueuedSet),
             budgetPaused = cacheBudgetPaused,
             retryCoolingDown = android.os.SystemClock.elapsedRealtime() < automaticRetryAfterMs,
         )
     }
 
     /** Live/manual previews preempt originals; historical batches share the fair channel gate. */
-    fun withDownloadSegment(block: () -> Unit, cancelled: () -> Boolean) {
+    fun withDownloadSegment(block: () -> Unit, priority: () -> Boolean = { false }, cancelled: () -> Boolean) {
         try {
             bulkGate.withOriginal(
-                shouldYield = { previewsNeedChannel().also { downloadWaitingForPreview = it } },
+                shouldYield = { (remoteControlActive || (!priority() && previewsNeedChannel())).also { downloadWaitingForPreview = it } },
                 cancelled = cancelled, block = block,
             )
         } finally { downloadWaitingForPreview = false }
@@ -1194,7 +1200,7 @@ object ThumbStore {
             autoQueue.clear(); autoQueuedSet.clear()
             // ★ 2.10：两段式队列同清（"清缓存"= 队列状态复位；随后 restartAutoFetch 全量重建）
             thumbQueue.clear(); thumbQueuedSet.clear()
-            previewQueue.clear(); previewQueuedSet.clear(); livePriority.clear(); directoryPriority.clear(); latestPriority.clear()
+            previewQueue.clear(); previewQueuedSet.clear(); livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
             seamlessPhase = FetchPhase.IDLE
             batchDone = 0; batchTotal = 0
             autoDone = 0; autoTotal = 0
@@ -1236,7 +1242,7 @@ object ThumbStore {
             thumbQueuedSet.clear()
             previewQueue.clear()
             previewQueuedSet.clear()
-            livePriority.clear(); directoryPriority.clear(); latestPriority.clear()
+            livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
             seamlessPhase = FetchPhase.IDLE
             batchDone = 0
             batchTotal = 0
@@ -1579,7 +1585,7 @@ object ThumbStore {
             thumbQueuedSet.clear()
             previewQueue.clear()
             previewQueuedSet.clear()
-            livePriority.clear(); directoryPriority.clear(); latestPriority.clear()
+            livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
             seamlessPhase = FetchPhase.IDLE
             autoTotal = 0
             autoDone = 0
@@ -1708,12 +1714,14 @@ object ThumbStore {
             //   原实现无条件 `sortBy { it.path }`（升序），而队列是"新→旧"（path 降序），
             //   于是每一批都被**翻成老→新**：每 K 张一组、组内倒序，用户看到的就是
             //   "加载顺序像随机"。方向感知后组内顺序 = 列表顺序，且仍是连续文件名。
-            if (batchPriority > 0) {
+            if (batchPriority == 4) {
+                // Already in visible-cell order; neither time nor JPG pairing may reorder it.
+            } else if (batchPriority > 0) {
                 batch.sortWith(compareByDescending<ObjectCacheKey> { it.mtime }.thenByDescending { it.path })
             } else {
                 orderBatchForSd(batch)
             }
-            val jpgFirst = JpgPreviewOrder.order(batch) { it.path }
+            val jpgFirst = if (batchPriority == 4) batch.toList() else JpgPreviewOrder.order(batch) { it.path }
             batch.clear()
             batch.addAll(jpgFirst)
             seamlessPhase =
@@ -1886,7 +1894,12 @@ object ThumbStore {
             thumbQueuedSet.clear()
             previewQueue.clear()
             previewQueuedSet.clear()
-            livePriority.clear(); directoryPriority.clear(); latestPriority.clear()
+            livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
+            if (visibleOwner != null && visibleDevice == io.github.bi2qfa.alphasync.core.ConnectionCenter.displayGuid()) {
+                visiblePriority.mark(visibleKeys)
+                visiblePriority.promote(visibleKeys, thumbQueue, thumbQueuedSet, ::thumbOnDisk)
+                visiblePriority.promote(visibleKeys, previewQueue, previewQueuedSet, ::previewOnDisk)
+            }
             countedAuto.clear()
             autoTotal = keys.size      // 仅记账（A3 后无 UI 消费，日志用）
             autoDone = 0
@@ -1967,6 +1980,29 @@ object ThumbStore {
         }
     }
 
+    /** Replace the viewport, never accumulate priority for cells scrolled off screen. */
+    fun focusVisible(owner: Any, keys: List<ObjectCacheKey>) {
+        synchronized(lock) {
+            visibleOwner = owner
+            visibleKeys = keys
+            visibleDevice = io.github.bi2qfa.alphasync.core.ConnectionCenter.displayGuid()
+            visiblePriority.clear()
+            visiblePriority.mark(keys)
+            visiblePriority.promote(keys, thumbQueue, thumbQueuedSet, ::thumbOnDisk)
+            visiblePriority.promote(keys, previewQueue, previewQueuedSet, ::previewOnDisk)
+            lock.notifyAll()
+        }
+    }
+
+    fun clearVisible(owner: Any) {
+        synchronized(lock) {
+            if (visibleOwner !== owner) return
+            visiblePriority.clear()
+            visibleOwner = null
+            visibleKeys = emptyList()
+        }
+    }
+
     fun injectNew(keys: List<ObjectCacheKey>) {
         if (keys.isEmpty()) return
         synchronized(lock) {
@@ -2029,8 +2065,16 @@ object ThumbStore {
 
     /** 新照片小图 → 新照片大预览 → 旧小图 → 旧预览；原图下载让位。 */
     private fun pollSeamless(): Pair<ObjectCacheKey, Int>? = synchronized(lock) {
+        if (remoteControlActive) return@synchronized null
         // Preview loading continues while original downloads wait for this workload.
         if (android.os.SystemClock.elapsedRealtime() < automaticRetryAfterMs) return@synchronized null
+        // The screen's order outranks capture time and off-screen live photos.
+        val visible = visiblePriority.poll(thumbQueue, thumbQueuedSet, cached = ::thumbOnDisk)
+            ?: visiblePriority.poll(previewQueue, previewQueuedSet, cached = ::previewOnDisk)
+        if (visible != null) {
+            if (states[visible.token] != ThumbState.READY) states[visible.token] = ThumbState.LOADING
+            return@synchronized (visible to PtpCodec.KIND_PREVIEW)
+        }
         // Live photos get both image sizes before any historical backlog.
         val liveThumb = livePriority.poll(thumbQueue, thumbQueuedSet, prefer = { item, queue -> JpgPreviewOrder.preferred(item, queue) { it.path } }, cached = ::thumbOnDisk)
         if (liveThumb != null) {
@@ -2078,6 +2122,7 @@ object ThumbStore {
      */
     private fun priorityOf(key: ObjectCacheKey): Int = synchronized(lock) {
         when {
+            visiblePriority.contains(key) -> 4
             livePriority.contains(key) -> 3
             latestPriority.contains(key) -> 2
             directoryPriority.contains(key) -> 1

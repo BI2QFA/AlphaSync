@@ -30,6 +30,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import io.github.bi2qfa.alphasync.ptpip.ObjectRepository
+import io.github.bi2qfa.alphasync.ui.floatingNavHeight
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -40,7 +41,7 @@ private val thumbnailSlots = Semaphore(3)
 
 /** Read all indexed albums permitted by Android; documents cover unindexed folders and RAW. */
 @Composable
-fun PhoneAlbumScreen(onDismiss: () -> Unit) {
+fun PhoneAlbumScreen(onDismiss: () -> Unit, navigation: @Composable () -> Unit) {
     val context = LocalContext.current
     var refresh by remember { mutableIntStateOf(0) }
     var photos by remember { mutableStateOf<List<AlbumPhoto>>(emptyList()) }
@@ -83,8 +84,10 @@ fun PhoneAlbumScreen(onDismiss: () -> Unit) {
     BackHandler { if (viewing.isNotEmpty()) viewing = arrayListOf() else onDismiss() }
     val visible = remember(photos, bucket) { if (bucket.isEmpty()) photos else photos.filter { it.bucket == bucket } }
     val knownEntries = remember(photos) { photos.associate { it.uri to ObjectRepository.FtpEntry(it.name, it.uri, false, it.size, it.timestamp) } }
+    val bottomInset = floatingNavHeight()
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.fillMaxSize().systemBarsPadding()) {
+        Column(Modifier.fillMaxSize().padding(bottom = bottomInset)
+            .consumeWindowInsets(PaddingValues(bottom = bottomInset)).systemBarsPadding()) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onDismiss) { Text("返回") }
                 Text("手机相册", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
@@ -116,7 +119,8 @@ fun PhoneAlbumScreen(onDismiss: () -> Unit) {
                 }
             }
         }
-        if (viewing.isNotEmpty()) PhoneAlbumViewer(viewing, knownEntries) { viewing = arrayListOf() }
+        if (viewing.isEmpty()) navigation()
+        else PhoneAlbumViewer(viewing, knownEntries) { viewing = arrayListOf() }
     }
 }
 

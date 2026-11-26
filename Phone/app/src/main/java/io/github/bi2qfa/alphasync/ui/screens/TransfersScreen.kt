@@ -604,8 +604,8 @@ private fun StatChip(label: String, count: Int) {    androidx.compose.material3.
  * 左边那枚绿底对号 + 满格进度条已经把"传完了"说清楚，不需要再写一遍。
  */
 private fun stateLabel(item: TransferItem): String = when (item.state) {
-    TransferState.QUEUED -> "等待传输"
-    TransferState.RUNNING -> if (io.github.bi2qfa.alphasync.data.ThumbStore.downloadWaitingForPreview) "已暂停下载，优先加载预览" else "传输中"
+    TransferState.QUEUED -> if (item.priorityDownload) "优先下载 · 等待传输" else "正常下载 · 等待传输"
+    TransferState.RUNNING -> if (item.priorityDownload) "优先下载中" else if (io.github.bi2qfa.alphasync.data.ThumbStore.downloadWaitingForPreview) "已暂停下载，优先加载预览" else "传输中"
     TransferState.DONE -> ""
     TransferState.FAILED -> "失败（开始传输时自动续传）"
 }

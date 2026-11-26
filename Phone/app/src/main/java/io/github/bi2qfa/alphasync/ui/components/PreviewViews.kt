@@ -61,7 +61,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -129,6 +129,7 @@ internal fun FullscreenPreview(
      */
     showSelectAction: Boolean = true,
     localUriOf: ((ObjectRepository.FtpEntry) -> Uri?)? = null,
+    onDownload: ((ObjectRepository.FtpEntry, Boolean) -> Unit)? = null,
 ) {
     val pagerState = rememberPagerState(initialPage = startIndex) { gallery.size }
 
@@ -163,6 +164,8 @@ internal fun FullscreenPreview(
     // 当前这一张（顶部文案与底部两个动作都用它）
     val current = gallery.getOrNull(pagerState.currentPage)
     val identity = current?.let { (if (localUriOf != null) "local" else SettingsRepo.lastConnectedDevice) + "\u0000" + ThumbStore.ObjectCacheKey(it.path, it.size, it.timestamp).token }
+    var lightRatioEnabled by remember { mutableStateOf(false) }
+    val lightRatio = remember(identity) { LightRatioState() }
     var histogramImage by remember(identity) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var histogramFailed by remember(identity) { mutableStateOf(false) }
     var histogram by remember(identity) { mutableStateOf<PhotoHistogram?>(null) }
@@ -183,10 +186,10 @@ internal fun FullscreenPreview(
             .background(MaterialTheme.colorScheme.surface),
     ) {
         Box(Modifier.fillMaxSize()) {
-        // The image has a full-window viewport; controls only overlay it.
+        // Keep the settings bar separate from the photo, including for tall screenshots.
         var controlsHeight by remember { mutableIntStateOf(0) }
         val controlsInset = with(LocalDensity.current) { controlsHeight.toDp() }
-        Box(Modifier.fillMaxSize().clipToBounds()) {
+        Box(Modifier.fillMaxSize().padding(top = controlsInset).clipToBounds()) {
         HorizontalPager(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
@@ -205,6 +208,7 @@ internal fun FullscreenPreview(
                     onOffset = { if (page == pagerState.currentPage) offset = it },
                     turnsOf = { rotationByPath[entry.path] ?: 0 },
                     onBaked = { n -> bakedByPath[entry.path] = n },
+                    lightRatio = lightRatio.takeIf { lightRatioEnabled && page == pagerState.currentPage },
                     onPreview = { image, failed ->
                         if (page == pagerState.currentPage) {
                             histogramImage = image
@@ -220,12 +224,7 @@ internal fun FullscreenPreview(
             Modifier
                 .fillMaxWidth()
                 .onSizeChanged { controlsHeight = it.height }
-                .background(
-                    Brush.verticalGradient(
-                        0f to Color.Black.copy(alpha = 0.55f),
-                        1f to Color.Transparent,
-                    ),
-                ),
+                .background(MaterialTheme.colorScheme.surfaceContainer),
         ) {
         AppHeader(
             title = gallery.getOrNull(pagerState.currentPage)?.name ?: "",
@@ -245,6 +244,7 @@ internal fun FullscreenPreview(
             },
         )
         var levelsMenuOpen by remember { mutableStateOf(false) }
+        var modeMenuOpen by remember { mutableStateOf(false) }
         FlowRow(Modifier.fillMaxWidth().padding(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             itemVerticalAlignment = Alignment.CenterVertically) {
@@ -275,6 +275,24 @@ internal fun FullscreenPreview(
                             },
                         )
                     }
+                }
+            }
+            if (SettingsRepo.tonalBlocksEnabled) Box {
+                OutlinedButton(
+                    onClick = { modeMenuOpen = true },
+                    modifier = Modifier.height(34.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                ) {
+                    Text("${SettingsRepo.tonalBlockMode.label} ▾", style = MaterialTheme.typography.labelSmall)
+                }
+                DropdownMenu(expanded = modeMenuOpen, onDismissRequest = { modeMenuOpen = false }) {
+                    for (mode in TonalBlocks.Mode.entries) DropdownMenuItem(
+                        text = { Text(mode.label + if (mode == SettingsRepo.tonalBlockMode) " ✓" else "") },
+                        onClick = {
+                            SettingsRepo.updateTonalBlockMode(mode)
+                            modeMenuOpen = false
+                        },
+                    )
                 }
             }
             OutlinedButton(onClick = { SettingsRepo.updateZebra(!SettingsRepo.zebraEnabled) },
@@ -308,7 +326,20 @@ internal fun FullscreenPreview(
                     )
                 }
             }
+            LightRatioToggle(lightRatioEnabled) {
+                lightRatioEnabled = !lightRatioEnabled
+                lightRatio.reset()
+            }
         }
+        if (lightRatioEnabled) LightRatioReadout(
+            lightRatio,
+            Modifier.padding(horizontal = 20.dp),
+            contentColor = MaterialTheme.colorScheme.onSurface,
+        )
+        HorizontalDivider(
+            modifier = Modifier.padding(top = 8.dp),
+            color = MaterialTheme.colorScheme.outlineVariant,
+        )
         }
         Box(Modifier.align(Alignment.TopEnd).fillMaxWidth().padding(top = controlsInset)) {
         if (SettingsRepo.histogramVisible) HistogramPanel(
@@ -357,6 +388,10 @@ internal fun FullscreenPreview(
                         },
                     )
                 }
+                if (onDownload != null && current != null) {
+                    add(NavItemSpec(null, "普通下载", false) { onDownload(current, false) })
+                    add(NavItemSpec(null, "优先下载", false) { onDownload(current, true) })
+                }
             },
         )
 
@@ -393,6 +428,7 @@ private fun PreviewPage(
     onOffset: (Offset) -> Unit,
     turnsOf: () -> Int = { 0 },
     onBaked: (Int) -> Unit = {},
+    lightRatio: LightRatioState? = null,
     onPreview: (androidx.compose.ui.graphics.ImageBitmap?, Boolean) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
@@ -413,14 +449,16 @@ private fun PreviewPage(
         catch (e: CancellationException) { throw e }
         catch (_: Exception) { zebraFailed = true }
     }
-    var tonalBitmap by remember(key, bmp, SettingsRepo.tonalBlockLevels) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    val tonalMode = SettingsRepo.tonalBlockMode
+    val tonalLevels = SettingsRepo.tonalBlockLevels
+    var tonalBitmap by remember(key, bmp, tonalLevels, tonalMode) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var tonalError by remember(key, bmp) { mutableStateOf(false) }
-    LaunchedEffect(key, bmp, isCurrent, SettingsRepo.tonalBlocksEnabled, SettingsRepo.tonalBlockLevels) {
+    LaunchedEffect(key, bmp, isCurrent, SettingsRepo.tonalBlocksEnabled, tonalLevels, tonalMode) {
         tonalBitmap = null
         tonalError = false
         val original = bmp
         if (!isCurrent || !SettingsRepo.tonalBlocksEnabled || original == null) return@LaunchedEffect
-        try { tonalBitmap = withContext(Dispatchers.Default) { tonalBlockPreview(original, SettingsRepo.tonalBlockLevels) } }
+        try { tonalBitmap = withContext(Dispatchers.Default) { tonalBlockPreview(original, tonalLevels, tonalMode) } }
         catch (e: CancellationException) { throw e }
         catch (_: Exception) { tonalError = true }
     }
@@ -532,7 +570,8 @@ private fun PreviewPage(
             .fillMaxSize()
             .onSizeChanged { boxSize = it }
             // 手势①：双击放大/复位。★ 单击不做事（用户定版：去掉"点击任意处返回"）。
-            .pointerInput(Unit) {
+            .pointerInput(lightRatio == null) {
+                if (lightRatio != null) return@pointerInput
                 detectTapGestures(
                     onDoubleTap = {
                         if (currentScale > 1.001f) {
@@ -598,6 +637,7 @@ private fun PreviewPage(
                 color = Color.White,
                 modifier = Modifier.align(Alignment.BottomCenter).background(Color.Black.copy(alpha = 0.65f)))
         }
+        if (b != null && lightRatio != null && anim.value == 0f) LightRatioLayer(b, lightRatio)
     }
 }
 
@@ -627,7 +667,7 @@ private fun CameraExifDialog(entry: ObjectRepository.FtpEntry, onDismiss: () -> 
             }
         }
     }
-    ExifInfoDialog(rows = rows, onDismiss = onDismiss)
+    ExifInfoDialog(rows = rows, fileSize = entry.size, onDismiss = onDismiss)
 }
 
 /**
@@ -648,12 +688,17 @@ private val EXIF_JSON_KEY = mapOf(
 @Composable
 private fun LocalPreviewExifDialog(entry: ObjectRepository.FtpEntry, uri: Uri?, onDismiss: () -> Unit) {
     val context = LocalContext.current
+    val knownSize = entry.size.takeIf { it > 0 }
+    var fileSize by remember(uri, knownSize) { mutableStateOf(knownSize) }
     var rows by remember(uri) { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
-    LaunchedEffect(uri) {
+    LaunchedEffect(uri, knownSize) {
+        if (uri != null && knownSize == null) {
+            fileSize = withContext(Dispatchers.IO) { LocalPhoto.fileSize(context, uri) }
+        }
         rows = withContext(Dispatchers.IO) {
             if (uri == null) listOf("文件名" to entry.name)
             else LocalPhoto.readExif(context, uri, entry.name)
         }
     }
-    ExifInfoDialog(rows = rows, onDismiss = onDismiss)
+    ExifInfoDialog(rows = rows, fileSize = fileSize, onDismiss = onDismiss)
 }

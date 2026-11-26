@@ -4,9 +4,12 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.runtime.CompositionLocalProvider
+import io.github.bi2qfa.alphasync.ui.components.LocalPreviewPageActive
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
@@ -39,6 +42,7 @@ fun FilesPagerScreen(
     topTick: Int = 0,
     /** ★ 第三批（§2）：横向位置（0=文件页，1=同步页）——AppRoot 持有、跨切换保留。 */
     pagerPage: MutableState<Int>,
+    refreshTick: Int = 0,
 ) {
     val scope = rememberCoroutineScope()
     // ★ 第三批（§2）：只在**本页首次组合**时取一次初始页（remember 快照）。
@@ -46,6 +50,13 @@ fun FilesPagerScreen(
     //   inputs，滑动回写会让它"变化"并触发 pager 重建；快照后初值恒定、pager 稳定。
     val initialPagerPage = remember { pagerPage.value }
     val pager = rememberPagerState(initialPage = initialPagerPage) { 2 }
+    val openedFromRemoteTick = remember { mutableIntStateOf(refreshTick) }
+    LaunchedEffect(refreshTick) {
+        if (openedFromRemoteTick.intValue != refreshTick) {
+            openedFromRemoteTick.intValue = refreshTick
+            pager.scrollToPage(0)
+        }
+    }
 
     // 横向位置回写（AppRoot 持有；离开组合前已是最后停留的那页）
     LaunchedEffect(pager) {
@@ -58,6 +69,7 @@ fun FilesPagerScreen(
     }
 
     HorizontalPager(state = pager, modifier = Modifier.fillMaxSize()) { page ->
+        CompositionLocalProvider(LocalPreviewPageActive provides (pager.currentPage == page)) {
         when (page) {
             0 -> FilesScreen(
                 onGoTransfers = onGoTransfers,
@@ -65,12 +77,14 @@ fun FilesPagerScreen(
                 onOpenSettings = onOpenSettings,
                 onSwitchDevice = onSwitchDevice,
                 topTick = topTick,
+                refreshTick = refreshTick,
             )
             else -> SyncScreen(
                 topTick = topTick,
                 onOpenSettings = onOpenSettings,
                 onSwitchDevice = onSwitchDevice,
             )
+        }
         }
     }
 }

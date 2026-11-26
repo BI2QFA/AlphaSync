@@ -37,6 +37,7 @@ import androidx.compose.material3.Switch
 import io.github.bi2qfa.alphasync.data.SettingsRepo
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import io.github.bi2qfa.alphasync.ui.components.ViewportPreviews
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -176,8 +177,8 @@ fun SyncScreen(
         exitSelectMode()
     }
 
-    fun doStartNow(targets: List<ObjectRepository.FtpEntry>) {
-        LiveTransferCenter.startNow(targets)
+    fun doStartNow(targets: List<ObjectRepository.FtpEntry>, priority: Boolean = false) {
+        LiveTransferCenter.startNow(targets, priority)
         exitSelectMode()
     }
 
@@ -358,6 +359,7 @@ fun SyncScreen(
             // ===== 内容：九宫格（默认）/ 列表 =====
             if (gridView) {
                 val gridState = rememberLazyGridState()
+                ViewportPreviews(entries) { gridState.layoutInfo.visibleItemsInfo.map { it.index } }
                 // 双击标题回顶（消费基线：旧信号不在分支重建后重放）
                 LaunchedEffect(topTick) {
                     if (topTick > topTickSeen) {
@@ -423,6 +425,7 @@ fun SyncScreen(
                 }
             } else {
                 val listState = rememberLazyListState()
+                ViewportPreviews(entries) { listState.layoutInfo.visibleItemsInfo.map { it.index } }
                 LaunchedEffect(topTick) {
                     if (topTick > topTickSeen) {
                         topTickSeen = topTick
@@ -521,10 +524,10 @@ fun SyncScreen(
                         },
                     )
                     ExpressiveButton(
-                        text = "立刻开始传输",
+                        text = "优先下载",
                         onClick = {
                             actionTargets = null
-                            doStartNow(targets)
+                            doStartNow(targets, priority = true)
                         },
                         modifier = Modifier.fillMaxWidth(),
                         tonal = true,
@@ -537,6 +540,11 @@ fun SyncScreen(
                                 animated = false,
                             )
                         },
+                    )
+                    ExpressiveButton(
+                        text = "正常下载（预览优先）",
+                        onClick = { actionTargets = null; doStartNow(targets) },
+                        modifier = Modifier.fillMaxWidth(), tonal = true,
                     )
                     ExpressiveButton(
                         text = "取消",
@@ -571,6 +579,14 @@ fun SyncScreen(
                 onOpenSettings = onOpenSettings,
                 onSwitchDevice = onSwitchDevice,
                 showSelectAction = false,
+                onDownload = { photo, priority ->
+                    if (connected) {
+                        LiveTransferCenter.startNow(listOf(photo), priority)
+                        android.widget.Toast.makeText(context,
+                            if (priority) "已加入优先下载队列" else "已加入下载队列",
+                            android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                },
             )
         }
     }

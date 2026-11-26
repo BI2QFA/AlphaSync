@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.exifinterface.media.ExifInterface
@@ -30,6 +31,21 @@ import java.nio.channels.FileChannel
  * 全程只读、不开临时文件（用 FileChannel 随机定位，ARW 不必整份读进内存）。
  */
 object LocalPhoto {
+
+    fun fileSize(context: Context, uri: Uri): Long? {
+        val resolver = context.contentResolver
+        val listedSize = runCatching {
+            resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                val column = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (column >= 0 && cursor.moveToFirst() && !cursor.isNull(column)) {
+                    cursor.getLong(column).takeIf { it >= 0 }
+                } else null
+            }
+        }.getOrNull()
+        return listedSize ?: runCatching {
+            resolver.openAssetFileDescriptor(uri, "r")?.use { it.length.takeIf { size -> size >= 0 } }
+        }.getOrNull()
+    }
 
     /** 内嵌预览的最小尺寸门槛：比这更小的都是 160×120 的小缩略图，点开看会糊。 */
     private const val MIN_PREVIEW_WIDTH = 800

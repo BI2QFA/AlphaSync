@@ -283,6 +283,26 @@ public class ThumbPrefetcher {
         }
     }
 
+    private boolean remotePaused;
+
+    /** Release dispensable cached previews before CameraEx allocates its live-view buffers. */
+    public void pauseForRemote() {
+        synchronized (lock) {
+            remotePaused = STATE_RUNNING.equals(state);
+            if (remotePaused) state = STATE_PAUSED;
+            previewCache.clear();
+            previewCacheBytes = 0;
+        }
+    }
+
+    public void resumeFromRemote() {
+        synchronized (lock) {
+            if (remotePaused && STATE_PAUSED.equals(state)) state = STATE_RUNNING;
+            remotePaused = false;
+            lock.notifyAll();
+        }
+    }
+
     public void pause() {
         synchronized (lock) {
             if (STATE_RUNNING.equals(state)) state = STATE_PAUSED;

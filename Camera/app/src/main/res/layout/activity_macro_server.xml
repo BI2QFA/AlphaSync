@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <SurfaceView
+        android:id="@+id/surfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <LinearLayout
+        android:id="@+id/topBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentTop="true"
+        android:background="#70000000"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingLeft="8dp"
+        android:paddingTop="4dp"
+        android:paddingRight="8dp"
+        android:paddingBottom="4dp">
+
+        <TextView
+            android:id="@+id/tvCameraStatus"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:maxLines="2"
+            android:text="F-- | -- | ISO -- | MF: --/--"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp" />
+
+        <com.sony.pmca.webcontrol.FocusScaleView
+            android:id="@+id/vFocusScale"
+            android:layout_width="88dp"
+            android:layout_height="14dp"
+            android:layout_marginLeft="6dp" />
+
+        <com.sony.pmca.webcontrol.BatteryView
+            android:id="@+id/vBattery"
+            android:layout_width="24dp"
+            android:layout_height="12dp"
+            android:layout_marginLeft="6dp" />
+
+        <TextView
+            android:id="@+id/tvBattery"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="3dp"
+            android:singleLine="true"
+            android:text="--%"
+            android:textColor="#00FF88"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvWifiStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentBottom="true"
+        android:background="#70000000"
+        android:gravity="center"
+        android:paddingLeft="8dp"
+        android:paddingTop="4dp"
+        android:paddingRight="8dp"
+        android:paddingBottom="4dp"
+        android:singleLine="true"
+        android:text="Wi-Fi: Initializing..."
+        android:textColor="#00FF88"
+        android:textSize="13sp" />
+
+</RelativeLayout>

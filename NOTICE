@@ -28,3 +28,14 @@ Copyright (c) 2026 BI2QFA
 
    Redistributions of the icon assets must retain this notice and include
    the full Apache License 2.0 text.
+
+Remote control integration (AlphaSync Direct, 2026)
+------------------------------------------------
+Based on hhb/sony-pmca-webcontrol 1.0.0, Copyright (c) 2026 haibo, MIT.
+License: LICENSES/Sony-PMCA-WebControl-MIT.txt.
+Adaptations include embedded navigation/proxy routing, parent-owned camera networking,
+preserving focus/drive/zoom settings on entry, and bounded JPEG retention.
+Sony API compile-only stubs: ma1co/OpenMemories-Framework, MIT; see
+LICENSES/OpenMemories-Framework-MIT.txt. These stubs are not packaged in the APK.
+NanoHTTPD 2.1.1 is bundled with its original copyright and BSD license header;
+see LICENSES/NanoHTTPD.txt.

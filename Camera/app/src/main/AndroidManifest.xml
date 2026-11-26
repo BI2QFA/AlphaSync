@@ -2,7 +2,7 @@
 <!-- 版本号的**权威在 app/build.gradle 的 defaultConfig**（构建合并时 Gradle 覆盖此处值）；
      这里同步维护一份只为直接查看方便 —— 升版本时两处一起改（PtpCodec.APP_VERSION 同改）。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="io.github.bi2qfa.alphasync" android:versionCode="13" android:versionName="1.0-direct.12">
+    package="io.github.bi2qfa.alphasync" android:versionCode="28" android:versionName="1.0-direct.27">
 
     <uses-sdk android:minSdkVersion="10" android:targetSdkVersion="10" />
 
@@ -40,5 +40,8 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name="com.sony.pmca.webcontrol.MacroServerActivity"
+            android:exported="false" android:screenOrientation="landscape"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
     </application>
 </manifest>
