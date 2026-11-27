@@ -395,11 +395,16 @@ fun FloatingNav(
         //   屏够宽时它自然长到 39dp 那个参考值；屏窄时收窄边距，而**药丸与圆钮的
         //   尺寸一个不动** —— 用户点名要"完全一样"的正是这两个。
         val navEdgePadding = with(density) {
+            if (actions != null && actions.size > 3) return@with 8.dp
             val fixed = (NavPillWidth + NavGap + CcButtonSize).toPx()
             val half = ((maxWidth.toPx() - fixed) / 2f)
                 .coerceIn(NavEdgePaddingMin.toPx(), NavEdgePaddingMax.toPx())
             half.toDp()
         }
+        val actionItemWidth = if (actions != null && actions.size > 3) {
+            ((maxWidth - navEdgePadding * 2 - NavGap - CcButtonSize) / actions.size)
+                .coerceIn(0.dp, NavItemWidth)
+        } else NavItemWidth
 
         // ★★ 用**真实的屏幕坐标**算位移，不再自己推 dp 公式。
         //
@@ -467,6 +472,7 @@ fun FloatingNav(
                     NavItemSpec(MsIcon.NAV_FILES, "文件", tabIndex == 1) { onTab(1) },
                     NavItemSpec(MsIcon.NAV_TRANSFERS, "传输", tabIndex == 2) { onTab(2) },
                 ),
+                itemWidth = actionItemWidth,
             )
             Spacer(Modifier.width(NavGap))
             // ★★ 两颗按钮由**同一个状态机**算出（见 [buttonState]）—— 这是"紫色按钮
@@ -822,7 +828,7 @@ private val NavEdgePaddingMin = 8.dp
  * （旋转/选择、旋转/信息）—— 药丸的几何与动效完全一致，只是条目数与内容不同。
  */
 class NavItemSpec(
-    val icon: MsIcon,
+    val icon: MsIcon?,
     val label: String,
     /** 未选中传 -1（预览器的动作按钮没有"选中"这回事）。 */
     val selected: Boolean,
@@ -898,7 +904,7 @@ private fun navAccents(): NavAccents {
 }
 
 @Composable
-private fun NavPill(items: List<NavItemSpec>) {
+private fun NavPill(items: List<NavItemSpec>, itemWidth: Dp) {
     val accents = navAccents()
     val tabIndex = items.indexOfFirst { it.selected }
     // ★★ 滑动高亮的水平位置**按实测的条目位置算**，不再用"条目宽×序号"推算。
@@ -987,6 +993,7 @@ private fun NavPill(items: List<NavItemSpec>) {
                         selected = spec.selected,
                         icon = spec.icon,
                         label = spec.label,
+                        itemWidth = itemWidth,
                         selectedTint = accents.indicatorOn,
                         modifier = Modifier.onGloballyPositioned { c ->
                             val x = c.positionInParent().x
@@ -1012,8 +1019,9 @@ private fun NavPill(items: List<NavItemSpec>) {
 @Composable
 private fun NavPillItem(
     selected: Boolean,
-    icon: MsIcon,
+    icon: MsIcon?,
     label: String,
+    itemWidth: Dp,
     /** 选中态图标色 —— 由 [navAccents] 按深浅色给（浅色 = 实色块上的反色）。 */
     selectedTint: Color,
     modifier: Modifier = Modifier,
@@ -1038,7 +1046,7 @@ private fun NavPillItem(
         modifier
             // 宽度 > 高度：图里的药丸是**修长**的，图标之间留白很大。
             // 48dp 高度是触摸区下限，再矮就不好按了。
-            .width(NavItemWidth)
+            .width(itemWidth)
             .height(NavItemHeight)
             .clip(shape)
             // 按压水波纹铺满条目、由上面的 clip 裁成药丸形：与滑动的指示块同形同大
@@ -1055,7 +1063,12 @@ private fun NavPillItem(
         // 所以选中态按下时仍会缩到 0.82，不会有一方失效。
         // ★ 实心只跟**选中**走（filled = selected），按压不再触发实心 ——
         //   用户定版："不应该是被触摸到就变实心，应该是选中了才变成实心"。
-        MsIcon(
+        if (icon == null) Text(
+            text = label,
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelSmall,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+        ) else MsIcon(
             icon = icon,
             contentDescription = label,
             interactionSource = itemSource,

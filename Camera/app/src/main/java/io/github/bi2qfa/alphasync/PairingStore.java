@@ -5,6 +5,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
+import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -246,6 +247,7 @@ public class PairingStore {
         if (in.peerDeviceId.length() == 0) {
             return;
         }
+        List<Paired> previous = new ArrayList<Paired>(table);
         for (int i = 0; i < table.size(); i++) {
             if (table.get(i).peerDeviceId.equals(in.peerDeviceId)) {
                 if (in.pairedAt == 0L) {
@@ -253,6 +255,7 @@ public class PairingStore {
                 }
                 table.set(i, in);
                 sortAndPersist();
+                restoreAfterSaveFailure(previous);
                 return;
             }
         }
@@ -261,6 +264,15 @@ public class PairingStore {
         }
         table.add(in);
         sortAndPersist();
+        restoreAfterSaveFailure(previous);
+    }
+
+    private void restoreAfterSaveFailure(List<Paired> previous) {
+        if (lastError != null) {
+            // 保存失败的手机不能仅凭内存表被放行，留给用户重试配对。
+            table.clear();
+            table.addAll(previous);
+        }
     }
 
     /** 解除配对。返回是否真的删掉了一条。 */
@@ -507,19 +519,34 @@ public class PairingStore {
         File tmp = new File(dir, f.getName() + ".tmp");
         OutputStreamWriter w = null;
         try {
-            w = new OutputStreamWriter(new FileOutputStream(tmp), "UTF-8");
+            FileOutputStream stream = new FileOutputStream(tmp);
+            w = new OutputStreamWriter(stream, "UTF-8");
             w.write(text);
             w.flush();
+            // flush 只清 Java 缓冲；必须同步文件内容后才发布新配对表。
+            stream.getFD().sync();
             w.close();
             w = null;
             // 先直接改名：POSIX（相机内部存储）上这是原子替换，不会出现半截表。
             // Windows（桌面回归）覆盖已存在文件会失败，再退到「删旧再改名」。
             if (tmp.renameTo(f)) {
+                syncStorage();
+                lastError = null;
                 return true;
             }
+            // 相机上的改名应原子覆盖。桌面 Windows 才允许删除旧文件再改名。
+            // Android 上删除旧表后掉电会丢掉所有配对，不能采用这个回退。
+            if (new File("/system/bin").isDirectory()) {
+                lastError = f.getName() + " 原子替换失败，已保留旧文件";
+                return false;
+            }
             if (f.exists() && !f.delete()) {
+                lastError = f.getName() + " 替换失败，旧文件无法删除";
+                return false;
             }
             if (tmp.renameTo(f)) {
+                syncStorage();
+                lastError = null;
                 return true;
             }
             lastError = f.getName() + " 改名失败";
@@ -540,6 +567,41 @@ public class PairingStore {
                 } catch (Throwable ignored) {
                 }
             }
+        }
+    }
+
+    /** 同步改名后的目录元数据；旧 Android 不提供 Java 目录 fsync，使用系统 sync。 */
+    protected void syncStorage() throws IOException {
+        File sync = new File("/system/bin/sync");
+        if (!sync.isFile()) {
+            if (!new File("/system/bin").isDirectory()) return; // 桌面回归
+            throw new IOException("系统 sync 不可用，无法确认配对记录已持久保存");
+        }
+        Process process = Runtime.getRuntime().exec(new String[] {sync.getAbsolutePath()});
+        try {
+            long start = System.nanoTime();
+            while (true) {
+                try {
+                    int result = process.exitValue();
+                    if (result != 0) throw new IOException("系统 sync 失败: " + result);
+                    return;
+                } catch (IllegalThreadStateException running) {
+                    if (System.nanoTime() - start > 5000000000L) {
+                        throw new IOException("系统 sync 超时");
+                    }
+                    try {
+                        Thread.sleep(20L);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("系统 sync 被中断");
+                    }
+                }
+            }
+        } finally {
+            process.destroy();
+            process.getInputStream().close();
+            process.getErrorStream().close();
+            process.getOutputStream().close();
         }
     }
 }

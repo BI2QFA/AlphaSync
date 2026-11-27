@@ -1,5 +1,12 @@
 package io.github.bi2qfa.alphasync.ui.components
 
+import android.net.Uri
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Arrangement
+
 /**
  * 全屏大预览 + 相机 EXIF 弹窗（2.11 UI 批次从 FilesScreen 抽取）。
  *
@@ -12,18 +19,33 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import io.github.bi2qfa.alphasync.data.ZebraHighlight
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import io.github.bi2qfa.alphasync.data.TonalBlocks
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -37,8 +59,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -47,6 +70,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.exifinterface.media.ExifInterface
+import io.github.bi2qfa.alphasync.data.SettingsRepo
+import io.github.bi2qfa.alphasync.data.PhotoHistogram
+import kotlinx.coroutines.CancellationException
 import io.github.bi2qfa.alphasync.data.LocalPhoto
 import io.github.bi2qfa.alphasync.data.ThumbStore
 import io.github.bi2qfa.alphasync.ptpip.ObjectRepository
@@ -102,13 +128,16 @@ internal fun FullscreenPreview(
      * 同步页不做选择模式（传输入队全自动），留一个点了没反应的按钮只会让人困惑。
      */
     showSelectAction: Boolean = true,
+    localUriOf: ((ObjectRepository.FtpEntry) -> Uri?)? = null,
+    onDownload: ((ObjectRepository.FtpEntry, Boolean) -> Unit)? = null,
 ) {
     val pagerState = rememberPagerState(initialPage = startIndex) { gallery.size }
 
     // 缩放与平移状态。**每张图各自一份**（key = 页码）：换到下一张时是
     // "新的图、新的 1x"，而不是把上一张的放大倍数带过去。
-    var scale by remember(pagerState.currentPage) { mutableStateOf(1f) }
-    var offset by remember(pagerState.currentPage) { mutableStateOf(Offset.Zero) }
+    val configuration = LocalConfiguration.current
+    var scale by remember(pagerState.currentPage, configuration.screenWidthDp, configuration.screenHeightDp) { mutableStateOf(1f) }
+    var offset by remember(pagerState.currentPage, configuration.screenWidthDp, configuration.screenHeightDp) { mutableStateOf(Offset.Zero) }
 
     // 1x 才让 Pager 能滑（放大后横向拖动归平移，见上面的分工表）
     val atBaseScale = scale <= 1.001f
@@ -134,15 +163,33 @@ internal fun FullscreenPreview(
     //   照片区独立 + 底部悬浮导航盖在内容上（与主界面"栏浮在内容之上"的模型一致）。
     // 当前这一张（顶部文案与底部两个动作都用它）
     val current = gallery.getOrNull(pagerState.currentPage)
+    val identity = current?.let { (if (localUriOf != null) "local" else SettingsRepo.lastConnectedDevice) + "\u0000" + ThumbStore.ObjectCacheKey(it.path, it.size, it.timestamp).token }
+    var lightRatioEnabled by remember { mutableStateOf(false) }
+    val lightRatio = remember(identity) { LightRatioState() }
+    var histogramImage by remember(identity) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var histogramFailed by remember(identity) { mutableStateOf(false) }
+    var histogram by remember(identity) { mutableStateOf<PhotoHistogram?>(null) }
+    var histogramError by remember(identity) { mutableStateOf(false) }
+    LaunchedEffect(identity, histogramImage, SettingsRepo.histogramVisible) {
+        histogram = null
+        histogramError = false
+        val image = histogramImage
+        if (!SettingsRepo.histogramVisible || image == null || identity == null) return@LaunchedEffect
+        try {
+            histogram = withContext(Dispatchers.Default) { HistogramCache.calculate(identity, image) }
+        } catch (e: CancellationException) { throw e }
+        catch (_: Exception) { histogramError = true }
+    }
     Box(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.surface),
     ) {
-        // 照片铺满整屏（标题与导航浮在它上面）→ 在整屏里居中，
-        // 而不是被顶部标题挤到下半屏（用户实测："预览图高度位置应该居中"）
         Box(Modifier.fillMaxSize()) {
-        // （照片区就是整屏，见上面外层 Box 的说明）
+        // Keep the settings bar separate from the photo, including for tall screenshots.
+        var controlsHeight by remember { mutableIntStateOf(0) }
+        val controlsInset = with(LocalDensity.current) { controlsHeight.toDp() }
+        Box(Modifier.fillMaxSize().padding(top = controlsInset).clipToBounds()) {
         HorizontalPager(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
@@ -152,26 +199,32 @@ internal fun FullscreenPreview(
             if (entry != null) {
                 PreviewPage(
                     entry = entry,
+                    localUri = localUriOf?.invoke(entry),
+                    isLocal = localUriOf != null,
+                    isCurrent = page == pagerState.currentPage,
                     scale = if (page == pagerState.currentPage) scale else 1f,
                     offset = if (page == pagerState.currentPage) offset else Offset.Zero,
                     onScale = { if (page == pagerState.currentPage) scale = it },
                     onOffset = { if (page == pagerState.currentPage) offset = it },
                     turnsOf = { rotationByPath[entry.path] ?: 0 },
                     onBaked = { n -> bakedByPath[entry.path] = n },
+                    lightRatio = lightRatio.takeIf { lightRatioEnabled && page == pagerState.currentPage },
+                    onPreview = { image, failed ->
+                        if (page == pagerState.currentPage) {
+                            histogramImage = image
+                            histogramFailed = failed
+                        }
+                    },
                 )
             }
         }
 
-        // ===== 顶部：标题浮层（照片满屏，垫一层压暗渐变保证白字可读）=====
+        }
         Column(
             Modifier
                 .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(
-                        0f to Color.Black.copy(alpha = 0.55f),
-                        1f to Color.Transparent,
-                    ),
-                ),
+                .onSizeChanged { controlsHeight = it.height }
+                .background(MaterialTheme.colorScheme.surfaceContainer),
         ) {
         AppHeader(
             title = gallery.getOrNull(pagerState.currentPage)?.name ?: "",
@@ -181,6 +234,124 @@ internal fun FullscreenPreview(
                 if (date.isNotBlank()) "$date · $seq" else seq
             },
             onBack = onDismiss,
+            actions = {
+                TextButton(onClick = { scale = 1f; offset = Offset.Zero }) {
+                    Text("整图", style = MaterialTheme.typography.labelSmall)
+                }
+                TextButton(onClick = { SettingsRepo.updateHistogram(visible = !SettingsRepo.histogramVisible) }) {
+                    Text(if (SettingsRepo.histogramVisible) "直方图 ✓" else "直方图", style = MaterialTheme.typography.labelSmall)
+                }
+            },
+        )
+        var levelsMenuOpen by remember { mutableStateOf(false) }
+        var modeMenuOpen by remember { mutableStateOf(false) }
+        FlowRow(Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            itemVerticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                modifier = Modifier.height(34.dp), contentPadding = PaddingValues(horizontal = 10.dp),
+                onClick = { SettingsRepo.updateTonalBlocks(!SettingsRepo.tonalBlocksEnabled) },
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (SettingsRepo.tonalBlocksEnabled)
+                        MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                ),
+            ) {
+                Text(if (SettingsRepo.tonalBlocksEnabled) "明暗块面：开" else "明暗块面：关", style = MaterialTheme.typography.labelSmall)
+            }
+            Box {
+                OutlinedButton(onClick = { levelsMenuOpen = true },
+                    modifier = Modifier.height(34.dp), contentPadding = PaddingValues(horizontal = 10.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)) {
+                    Text("${SettingsRepo.tonalBlockLevels} 层 ▾", style = MaterialTheme.typography.labelSmall)
+                }
+                DropdownMenu(expanded = levelsMenuOpen, onDismissRequest = { levelsMenuOpen = false }) {
+                    for (levels in TonalBlocks.supportedLevels) {
+                        DropdownMenuItem(
+                            text = { Text("$levels 层" + if (SettingsRepo.tonalBlockLevels == levels) " ✓" else "") },
+                            onClick = {
+                                SettingsRepo.updateTonalBlockLevels(levels)
+                                levelsMenuOpen = false
+                            },
+                        )
+                    }
+                }
+            }
+            if (SettingsRepo.tonalBlocksEnabled) Box {
+                OutlinedButton(
+                    onClick = { modeMenuOpen = true },
+                    modifier = Modifier.height(34.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                ) {
+                    Text("${SettingsRepo.tonalBlockMode.label} ▾", style = MaterialTheme.typography.labelSmall)
+                }
+                DropdownMenu(expanded = modeMenuOpen, onDismissRequest = { modeMenuOpen = false }) {
+                    for (mode in TonalBlocks.Mode.entries) DropdownMenuItem(
+                        text = { Text(mode.label + if (mode == SettingsRepo.tonalBlockMode) " ✓" else "") },
+                        onClick = {
+                            SettingsRepo.updateTonalBlockMode(mode)
+                            modeMenuOpen = false
+                        },
+                    )
+                }
+            }
+            OutlinedButton(onClick = { SettingsRepo.updateZebra(!SettingsRepo.zebraEnabled) },
+                modifier = Modifier.height(34.dp), contentPadding = PaddingValues(horizontal = 10.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (SettingsRepo.zebraEnabled)
+                        MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                )) {
+                Text(if (SettingsRepo.zebraEnabled) "斑马纹：开" else "斑马纹：关", style = MaterialTheme.typography.labelSmall)
+            }
+            var zebraMenuOpen by remember { mutableStateOf(false) }
+            Box {
+                OutlinedButton(onClick = { zebraMenuOpen = true },
+                    modifier = Modifier.height(34.dp), contentPadding = PaddingValues(horizontal = 10.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)) {
+                    Text("≥${SettingsRepo.zebraThreshold}% ▾", style = MaterialTheme.typography.labelSmall)
+                }
+                DropdownMenu(expanded = zebraMenuOpen, onDismissRequest = { zebraMenuOpen = false }) {
+                    for (threshold in ZebraHighlight.thresholds) DropdownMenuItem(
+                        text = {
+                            Column(Modifier.fillMaxWidth(0.8f)) {
+                                Text("$threshold%" + if (SettingsRepo.zebraThreshold == threshold) " ✓" else "")
+                                Text(ZebraHighlight.usage(threshold), style = MaterialTheme.typography.bodySmall)
+                            }
+                        },
+                        onClick = {
+                            SettingsRepo.updateZebraThreshold(threshold)
+                            zebraMenuOpen = false
+                        },
+                    )
+                }
+            }
+            LightRatioToggle(lightRatioEnabled) {
+                lightRatioEnabled = !lightRatioEnabled
+                lightRatio.reset()
+            }
+        }
+        if (lightRatioEnabled) LightRatioReadout(
+            lightRatio,
+            Modifier.padding(horizontal = 20.dp),
+            contentColor = MaterialTheme.colorScheme.onSurface,
+        )
+        HorizontalDivider(
+            modifier = Modifier.padding(top = 8.dp),
+            color = MaterialTheme.colorScheme.outlineVariant,
+        )
+        }
+        Box(Modifier.align(Alignment.TopEnd).fillMaxWidth().padding(top = controlsInset)) {
+        if (SettingsRepo.histogramVisible) HistogramPanel(
+            histogram = histogram,
+            status = when {
+                histogramFailed -> "直方图不可用：预览加载失败"
+                histogramError -> "直方图计算失败，可关闭后重新打开"
+                histogramImage == null -> "等待大预览加载…"
+                else -> "正在计算…"
+            },
+            rgb = SettingsRepo.histogramRgb,
+            onRgb = { SettingsRepo.updateHistogram(rgb = it) },
         )
         }
 
@@ -217,12 +388,17 @@ internal fun FullscreenPreview(
                         },
                     )
                 }
+                if (onDownload != null && current != null) {
+                    add(NavItemSpec(null, "普通下载", false) { onDownload(current, false) })
+                    add(NavItemSpec(null, "优先下载", false) { onDownload(current, true) })
+                }
             },
         )
 
         // ★ 2.7.0 需求 3：照片信息弹窗（数据源 = 随大预览传回并缓存的 sidecar EXIF）
         if (infoOpen && current != null) {
-            CameraExifDialog(entry = current, onDismiss = { infoOpen = false })
+            if (localUriOf == null) CameraExifDialog(entry = current, onDismiss = { infoOpen = false })
+            else LocalPreviewExifDialog(current, localUriOf(current)) { infoOpen = false }
         }
         }
     }
@@ -243,25 +419,83 @@ internal fun FullscreenPreview(
 @Composable
 private fun PreviewPage(
     entry: ObjectRepository.FtpEntry,
+    localUri: Uri? = null,
+    isLocal: Boolean = false,
+    isCurrent: Boolean,
     scale: Float,
     offset: Offset,
     onScale: (Float) -> Unit,
     onOffset: (Offset) -> Unit,
     turnsOf: () -> Int = { 0 },
     onBaked: (Int) -> Unit = {},
+    lightRatio: LightRatioState? = null,
+    onPreview: (androidx.compose.ui.graphics.ImageBitmap?, Boolean) -> Unit = { _, _ -> },
 ) {
+    val context = LocalContext.current
     val key = ThumbStore.ObjectCacheKey(
         path = entry.path,
         size = entry.size,
         mtime = entry.timestamp,
     )
     var bmp by remember(key) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var zebraBitmap by remember(key, bmp, SettingsRepo.zebraThreshold) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var zebraFailed by remember(key, bmp) { mutableStateOf(false) }
+    LaunchedEffect(key, bmp, isCurrent, SettingsRepo.zebraEnabled, SettingsRepo.zebraThreshold) {
+        zebraBitmap = null
+        zebraFailed = false
+        val original = bmp
+        if (!isCurrent || !SettingsRepo.zebraEnabled || original == null) return@LaunchedEffect
+        try { zebraBitmap = withContext(Dispatchers.Default) { zebraPreview(original, SettingsRepo.zebraThreshold) } }
+        catch (e: CancellationException) { throw e }
+        catch (_: Exception) { zebraFailed = true }
+    }
+    val tonalMode = SettingsRepo.tonalBlockMode
+    val tonalLevels = SettingsRepo.tonalBlockLevels
+    var tonalBitmap by remember(key, bmp, tonalLevels, tonalMode) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var tonalError by remember(key, bmp) { mutableStateOf(false) }
+    LaunchedEffect(key, bmp, isCurrent, SettingsRepo.tonalBlocksEnabled, tonalLevels, tonalMode) {
+        tonalBitmap = null
+        tonalError = false
+        val original = bmp
+        if (!isCurrent || !SettingsRepo.tonalBlocksEnabled || original == null) return@LaunchedEffect
+        try { tonalBitmap = withContext(Dispatchers.Default) { tonalBlockPreview(original, tonalLevels, tonalMode) } }
+        catch (e: CancellationException) { throw e }
+        catch (_: Exception) { tonalError = true }
+    }
     var failed by remember(key) { mutableStateOf(false) }
+    val reportPreview by rememberUpdatedState(onPreview)
+    LaunchedEffect(key, isCurrent, bmp, failed) {
+        if (isCurrent) reportPreview(bmp, failed)
+    }
+    var failureReason by remember(key) { mutableStateOf<String?>(null) }
+    var retryTick by remember(key) { mutableIntStateOf(0) }
     /** 这张图**已经转过几段**（绝对次数，父层按钮的限流依据）。 */
     var baked by remember(entry.path) { mutableIntStateOf(0) }
 
-    LaunchedEffect(key) {
-        val b = withContext(Dispatchers.IO) { ThumbStore.fetchPreviewBlocking(key) }
+    LaunchedEffect(key, isCurrent, retryTick) {
+        if (!isCurrent) {
+            // Keep only the current local high-resolution image, not multiple full-size pages.
+            if (isLocal) bmp = null
+            return@LaunchedEffect
+        }
+        if (bmp != null) return@LaunchedEffect
+        failed = false
+        failureReason = null
+        val jpeg = entry.ext == "jpg" || entry.ext == "jpeg"
+        val b = if (isLocal) withContext(Dispatchers.IO) {
+            localUri?.let { LocalPhoto.loadPreview(context, it, entry.name) }
+        } else io.github.bi2qfa.alphasync.data.loadPreviewWithRetry(
+            maxAttempts = if (jpeg) 8 else 1,
+            canRetry = { io.github.bi2qfa.alphasync.core.ConnectionCenter.host != null },
+        ) {
+            withContext(Dispatchers.IO) {
+                val image = ThumbStore.fetchPreviewBlocking(key)
+                image to ThumbStore.previewError(key)
+            }.let { (image, reason) ->
+                failureReason = reason
+                image
+            }
+        }
         if (b == null) {
             failed = true
             return@LaunchedEffect
@@ -271,7 +505,10 @@ private fun PreviewPage(
         // ★ 先算好位图、把 baked 落定、回报给父层，**最后**才赋 bmp —— 旋转协程是靠
         //   "bmp 从无到有"被唤醒的，必须等这些状态都就位再放它跑。
         val already = turnsOf()
-        val loaded = PhotoRotate.rotateSteps(b, already)
+        val exifTurns = if (isLocal && localUri != null) withContext(Dispatchers.IO) {
+            LocalPhoto.previewExifTurns(context, localUri, entry.name)
+        } else 0
+        val loaded = PhotoRotate.rotateSteps(b, exifTurns + already)
         baked = already
         onBaked(already)
         bmp = loaded
@@ -333,7 +570,8 @@ private fun PreviewPage(
             .fillMaxSize()
             .onSizeChanged { boxSize = it }
             // 手势①：双击放大/复位。★ 单击不做事（用户定版：去掉"点击任意处返回"）。
-            .pointerInput(Unit) {
+            .pointerInput(lightRatio == null) {
+                if (lightRatio != null) return@pointerInput
                 detectTapGestures(
                     onDoubleTap = {
                         if (currentScale > 1.001f) {
@@ -368,15 +606,38 @@ private fun PreviewPage(
         val b = bmp
         when {
             b != null -> Image(
-                b,
+                if (SettingsRepo.tonalBlocksEnabled && isCurrent) tonalBitmap ?: b else b,
                 contentDescription = entry.name,
                 modifier = Modifier.fillMaxSize(),
                 // Fit：整图可见优先。放大靠手势，不靠 contentScale
                 contentScale = ContentScale.Fit,
             )
-            failed -> Text("无法获取预览", color = MaterialTheme.colorScheme.error)
+            failed -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("无法获取预览", color = MaterialTheme.colorScheme.error)
+                failureReason?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth(0.9f))
+                }
+                TextButton(onClick = { retryTick++ }) { Text("重试") }
+            }
             else -> CircularProgressIndicator(color = Color.White)
         }
+        if (b != null && isCurrent && SettingsRepo.zebraEnabled) {
+            zebraBitmap?.let { overlay ->
+                Image(overlay, contentDescription = "高光斑马纹", modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit)
+            }
+            if (zebraFailed) Text("斑马纹生成失败，可关闭后重试", color = Color.White,
+                modifier = Modifier.align(Alignment.BottomCenter).background(Color.Black.copy(alpha = 0.65f)))
+        }
+        if (b != null && isCurrent && SettingsRepo.tonalBlocksEnabled && tonalBitmap == null) {
+            Text(if (tonalError) "明暗块面处理失败，显示原预览" else "正在生成明暗块面…",
+                color = Color.White,
+                modifier = Modifier.align(Alignment.BottomCenter).background(Color.Black.copy(alpha = 0.65f)))
+        }
+        if (b != null && lightRatio != null && anim.value == 0f) LightRatioLayer(b, lightRatio)
     }
 }
 
@@ -406,7 +667,7 @@ private fun CameraExifDialog(entry: ObjectRepository.FtpEntry, onDismiss: () -> 
             }
         }
     }
-    ExifInfoDialog(rows = rows, onDismiss = onDismiss)
+    ExifInfoDialog(rows = rows, fileSize = entry.size, onDismiss = onDismiss)
 }
 
 /**
@@ -423,3 +684,21 @@ private val EXIF_JSON_KEY = mapOf(
     ExifInterface.TAG_EXPOSURE_BIAS_VALUE to "ev",
     ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY to "iso",
 )
+
+@Composable
+private fun LocalPreviewExifDialog(entry: ObjectRepository.FtpEntry, uri: Uri?, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val knownSize = entry.size.takeIf { it > 0 }
+    var fileSize by remember(uri, knownSize) { mutableStateOf(knownSize) }
+    var rows by remember(uri) { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
+    LaunchedEffect(uri, knownSize) {
+        if (uri != null && knownSize == null) {
+            fileSize = withContext(Dispatchers.IO) { LocalPhoto.fileSize(context, uri) }
+        }
+        rows = withContext(Dispatchers.IO) {
+            if (uri == null) listOf("文件名" to entry.name)
+            else LocalPhoto.readExif(context, uri, entry.name)
+        }
+    }
+    ExifInfoDialog(rows = rows, fileSize = fileSize, onDismiss = onDismiss)
+}

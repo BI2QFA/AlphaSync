@@ -43,6 +43,66 @@ object SettingsRepo {
 
     var downloadTreeUri by mutableStateOf("")
         private set
+    var autoSyncJpg by mutableStateOf(true)
+        private set
+    var autoSyncRaw by mutableStateOf(true)
+        private set
+    var autoSyncEnabled by mutableStateOf(false)
+        private set
+
+    fun updateAutoSyncEnabled(enabled: Boolean) {
+        autoSyncEnabled = enabled
+        prefs.edit().putBoolean("autoSyncEnabled", enabled).apply()
+    }
+
+    var zebraThreshold by mutableIntStateOf(95)
+        private set
+    fun updateZebraThreshold(value: Int) {
+        zebraThreshold = ZebraHighlight.validThreshold(value)
+        prefs.edit().putInt("zebraThreshold", zebraThreshold).apply()
+    }
+    var zebraEnabled by mutableStateOf(false)
+        private set
+    fun updateZebra(enabled: Boolean) {
+        zebraEnabled = enabled
+        prefs.edit().putBoolean("zebraEnabled", enabled).apply()
+    }
+    var tonalBlockLevels by mutableIntStateOf(4)
+        private set
+
+    internal var tonalBlockMode by mutableStateOf(TonalBlocks.Mode.FIXED_BRIGHTNESS)
+        private set
+
+    internal fun updateTonalBlockMode(mode: TonalBlocks.Mode) {
+        tonalBlockMode = mode
+        prefs.edit().putString("tonalBlockMode", mode.name).apply()
+    }
+    fun updateTonalBlockLevels(levels: Int) {
+        tonalBlockLevels = TonalBlocks.validLevels(levels)
+        prefs.edit().putInt("tonalBlockLevels", tonalBlockLevels).apply()
+    }
+    var tonalBlocksEnabled by mutableStateOf(false)
+        private set
+    fun updateTonalBlocks(enabled: Boolean) {
+        tonalBlocksEnabled = enabled
+        prefs.edit().putBoolean("tonalBlocksEnabled", enabled).apply()
+    }
+
+    var histogramVisible by mutableStateOf(false)
+        private set
+    var histogramRgb by mutableStateOf(false)
+        private set
+    fun updateHistogram(visible: Boolean = histogramVisible, rgb: Boolean = histogramRgb) {
+        histogramVisible = visible
+        histogramRgb = rgb
+        prefs.edit().putBoolean("histogramVisible", visible).putBoolean("histogramRgb", rgb).apply()
+    }
+
+    fun updateAutoSyncFormats(jpg: Boolean, raw: Boolean) {
+        autoSyncJpg = jpg
+        autoSyncRaw = raw
+        prefs.edit().putBoolean("autoSyncJpg", jpg).putBoolean("autoSyncRaw", raw).apply()
+    }
     var seedIndex by mutableIntStateOf(0)
         private set
     var dynamicColor by mutableStateOf(true)
@@ -74,6 +134,18 @@ object SettingsRepo {
 
     fun init(context: Context) {
         prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        autoSyncJpg = prefs.getBoolean("autoSyncJpg", true)
+        autoSyncRaw = prefs.getBoolean("autoSyncRaw", true)
+        autoSyncEnabled = prefs.getBoolean("autoSyncEnabled", false)
+        zebraThreshold = ZebraHighlight.validThreshold(prefs.getInt("zebraThreshold", 95))
+        zebraEnabled = prefs.getBoolean("zebraEnabled", false)
+        tonalBlockLevels = TonalBlocks.validLevels(prefs.getInt("tonalBlockLevels", 4))
+        val savedTonalMode = prefs.getString("tonalBlockMode", null)
+        tonalBlockMode = TonalBlocks.Mode.entries.firstOrNull { it.name == savedTonalMode }
+            ?: TonalBlocks.Mode.FIXED_BRIGHTNESS
+        tonalBlocksEnabled = prefs.getBoolean("tonalBlocksEnabled", false)
+        histogramVisible = prefs.getBoolean("histogramVisible", false)
+        histogramRgb = prefs.getBoolean("histogramRgb", false)
         downloadTreeUri = prefs.getString(KEY_TREE, "") ?: ""
         seedIndex = prefs.getInt(KEY_SEED, 0)
         dynamicColor = prefs.getBoolean(KEY_DYNAMIC, true)
@@ -93,6 +165,33 @@ object SettingsRepo {
         if (guidHex.isBlank() || guidHex.equals(lastConnectedDevice, ignoreCase = true)) return
         lastConnectedDevice = guidHex
         prefs.edit().putString(KEY_LAST_DEVICE, guidHex).apply()
+    }
+
+    fun lastDirectory(guid: String = lastConnectedDevice): String {
+        if (guid.isBlank() || !::prefs.isInitialized) return "/"
+        return DirectoryPreference.normalize(prefs.getString("lastDirectory.${guid.lowercase()}", "/"))
+    }
+
+    fun rememberDirectory(guid: String, path: String) {
+        if (guid.isBlank()) return
+        val normalized = DirectoryPreference.normalize(path)
+        if (lastDirectory(guid) == normalized) return
+        prefs.edit().putString("lastDirectory.${guid.lowercase()}", normalized).apply()
+    }
+
+    fun filesFormat(guid: String): String =
+        if (guid.isBlank() || !::prefs.isInitialized) "All"
+        else prefs.getString("filesFormat.${guid.lowercase()}", "All") ?: "All"
+
+    fun filesGridView(guid: String): Boolean =
+        guid.isNotBlank() && ::prefs.isInitialized && prefs.getBoolean("filesGrid.${guid.lowercase()}", false)
+
+    fun rememberFilesDisplay(guid: String, format: String, grid: Boolean) {
+        if (guid.isBlank()) return
+        prefs.edit()
+            .putString("filesFormat.${guid.lowercase()}", format)
+            .putBoolean("filesGrid.${guid.lowercase()}", grid)
+            .apply()
     }
 
     fun updateDownloadTreeUri(v: String) {

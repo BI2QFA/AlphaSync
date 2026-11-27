@@ -188,6 +188,8 @@ fun AppHeader(
                 }
             }
             actions?.invoke(this)
+            Spacer(Modifier.width(8.dp))
+            CameraReceiveSpeed()
         }
     }
 }

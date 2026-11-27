@@ -26,7 +26,7 @@ public final class PtpCodec {
      * 本应用的版本号字符串（**日志、关于页、探测包厂商标识共用这一处**）。
      * ★ 升版本时这里 + {@code build.gradle} + {@code AndroidManifest} 一起改。
      */
-    public static final String APP_VERSION = "1.0";
+    public static final String APP_VERSION = "1.0-direct.12";
 
     // ===== 通用包头 =====
     // Length(4, LE, 含包头在内的整包字节数) + Type(4, LE)
@@ -201,7 +201,8 @@ public final class PtpCodec {
      * ★ 它是**协议契约**：手机端 {@code PtpCodec.VENDOR_TAG} 必须与本处逐字一致，
      *   不一致时手机端就"扫不到设备"——改版本号时两端必须一起改、一起装。
      */
-    public static final String VENDOR_TAG = "AlphaSync/" + APP_VERSION;
+    // 发现协议标记独立于安装包版本，必须兼容现有手机端。
+    public static final String VENDOR_TAG = "AlphaSync/1.0";
 
     // ============================================================
     // 基础字节读写（小端）

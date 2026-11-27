@@ -41,6 +41,10 @@ object ObjectRepository {
 
     private const val TAG = "ObjectRepository"
 
+    @Volatile
+    var lastConnectError: String? = null
+        private set
+
     /** 建连接超时（含握手 + 双向认证）。 */
     private const val CONNECT_TIMEOUT_MS = 5000
 
@@ -197,6 +201,7 @@ object ObjectRepository {
         friendlyName: String,
         onEvent: PtpIpClient.EventListener? = null,
     ): ConnectOutcome {
+        lastConnectError = null
         sessions[host]?.let { if (it.client.isConnected) return ConnectOutcome.OK else disconnect(host) }
         return try {
             ioExecutor.submit<ConnectOutcome> {
@@ -222,6 +227,7 @@ object ObjectRepository {
                     ConnectOutcome.OK
                 } catch (e: InitFailedException) {
                     // 相机在 Init 阶段就把门关上了 —— 拒绝码正是它想告诉我们的话
+                    lastConnectError = "相机拒绝连接（0x${Integer.toHexString(e.reason)}）"
                     Log.d(TAG, "connect rejected: reason=0x${Integer.toHexString(e.reason)}")
                     runCatching { client.close() }
                     when (e.reason) {
@@ -230,12 +236,14 @@ object ObjectRepository {
                         else -> ConnectOutcome.FAILED
                     }
                 } catch (e: Exception) {
+                    lastConnectError = "${e.javaClass.simpleName}: ${e.message.orEmpty()}"
                     Log.d(TAG, "connect failed: ${e.javaClass.simpleName} ${e.message}")
                     runCatching { client.close() }
                     ConnectOutcome.FAILED
                 }
             }.get()
         } catch (e: Exception) {
+            lastConnectError = "${e.javaClass.simpleName}: ${e.message.orEmpty()}"
             Log.d(TAG, "connect submit failed: ${e.message}")
             ConnectOutcome.FAILED
         }
@@ -450,6 +458,7 @@ object ObjectRepository {
         val entries: List<FtpEntry>,
         val nextOffset: Int,
         val hasMore: Boolean,
+        val totalCount: Int? = null,
     )
 
     /**
@@ -568,7 +577,9 @@ object ObjectRepository {
         throw IOException("心跳失败", e)
     }
 
-    /** 相机设备信息（厂商 JSON，字段并入现有 DeviceInfo）。 */
+    /** 最近一次控制连接数据距离现在的时间，用于避免断线误判。 */
+    fun responseAgeMs(host: String): Long = sessions[host]?.client?.responseAgeMs() ?: Long.MAX_VALUE
+
     fun deviceInfo(host: String): JSONObject? = try {
         ioExecutor.submit<JSONObject?> {
             val bytes = requireClient(host).deviceInfo()
@@ -639,17 +650,21 @@ object ObjectRepository {
             ?: (requestedLimit > 0 && out.size >= requestedLimit)
         val next = root?.optInt("nextOffset", requestedOffset + out.size)
             ?: (requestedOffset + out.size)
-        return DirPage(sorted, next, hasMore)
+        val totalCount = root?.takeIf { it.has("totalCount") }?.optInt("totalCount", -1)?.takeIf { it >= 0 }
+        return DirPage(sorted, next, hasMore, totalCount)
     }
 
     // ============================================================
     // 缩略图 / 预览（GET_OBJECT + 文件端口，一次性令牌）
     // ============================================================
 
-    /** 大预览（1616×1080 内嵌 JPEG，~0.4MB）。失败返回 null。 */
-    fun fetchVirtualPreview(host: String, cameraPath: String): ByteArray? =
-        fetchObject(host, normalize(cameraPath), PtpCodec.KIND_PREVIEW, IO_TIMEOUT_MS)
+    private val previewFailure = ThreadLocal<String?>()
+    fun lastPreviewFailure(): String? = previewFailure.get()
 
+    fun fetchVirtualPreview(host: String, cameraPath: String): ByteArray? {
+        previewFailure.remove()
+        return fetchObject(host, normalize(cameraPath), PtpCodec.KIND_PREVIEW, 8000)
+    }
     private fun normalize(cameraPath: String): String =
         if (cameraPath.startsWith("/")) cameraPath else "/$cameraPath"
 
@@ -697,6 +712,7 @@ object ObjectRepository {
         val t = client.getObjectWhole(p, kind)
         ObjectTicket(host, p, kind, t.token, t.filePort, client.connNo, client)
     } catch (e: Exception) {
+        if (kind == PtpCodec.KIND_PREVIEW) previewFailure.set("请求预览失败：${e.message ?: e.javaClass.simpleName}")
         Log.d(TAG, "openObjectTicket failed kind=$kind path=$cameraPath: ${e.message}")
         null
     }
@@ -742,6 +758,9 @@ object ObjectRepository {
         //   0/0 不满足短收条件，旧判据会当"成功"交出空数组、被上层写进缓存。
         //   现在与批量路径同一条纪律：**必须 total > 0 且收满**才交付。
         if (total <= 0 || received != total) {
+            if (t.kind == PtpCodec.KIND_PREVIEW) previewFailure.set(
+                if (total == 0L) "相机未提供 JPG/ARW 大预览（返回 0 字节）"
+                else "预览传输不完整（收到 $received / $total 字节）")
             Log.d(TAG, "downloadObject 短收/空占位 kind=${t.kind} path=${t.path} 收到 $received / 共 $total")
             null
         } else {
@@ -751,6 +770,7 @@ object ObjectRepository {
             bytes
         }
     } catch (e: Exception) {
+        if (t.kind == PtpCodec.KIND_PREVIEW) previewFailure.set("预览传输失败：${e.message ?: e.javaClass.simpleName}")
         Log.d(TAG, "downloadObject failed kind=${t.kind} path=${t.path}: ${e.message}")
         null
     }
@@ -905,6 +925,9 @@ object ObjectRepository {
      *
      * ★ 续传前调用方应先 `stat()` 校验 size/mtime 未变（相机端也按 token TTL 兜底）。
      */
+    private val transferFailures = java.util.concurrent.ConcurrentHashMap<String, String>()
+    fun lastTransferFailure(path: String): String? = transferFailures[path]
+
     fun pumpToStream(
         host: String,
         path: String,
@@ -912,7 +935,10 @@ object ObjectRepository {
         out: OutputStream,
         cancelled: () -> Boolean,
         onProgress: (Long) -> Unit,
+        withSegment: (() -> Unit) -> Unit = { it() },
+        yieldForPreview: () -> Boolean = { false },
     ): PumpResult {
+        transferFailures.remove(path)
         var total = -1L
         return try {
             xferExecutor.submit<PumpResult> {
@@ -921,8 +947,8 @@ object ObjectRepository {
                 if (startOffset > stat.size) {
                     throw IOException("续传位置超过对象大小")
                 }
-                val ticket = client.getObject(path, PtpCodec.KIND_ORIGINAL, startOffset, -1)
-                val expectedRemaining = stat.size - startOffset
+
+
                 // ★ 2.7.0 提速诊断：原图传输（ORIGINAL 通道**不做任何解析**，纯 SD 读 +
                 //   发送）的端到端速率 = "链路 + 相机发送"的上限。与预览通道的速率
                 //   一对照即可分辨瓶颈：两者都掉 = 链路饱和；只有预览掉 = 相机解图 CPU 饱和。
@@ -946,45 +972,63 @@ object ObjectRepository {
                     lastTick = System.currentTimeMillis()
                     onProgress(now)
                 }
-                val received = DataChannel(
-                    host = host,
-                    filePort = ticket.filePort,
-                    // ★ 同 fetchObject：数据连接的身份必须与主控制会话一致（本机自己的 guid16）
-                    guid16 = IdentityRepo.guid16(),
-                    connNo = client.connNo,
-                    socketFactory = socketFactoryOrNull(),
-                ).use { ch ->
-                    ch.download(
-                        token = ticket.token,
-                        expectedTxId = 1,
-                        expectedBytes = expectedRemaining,
-                        timeoutMs = IO_TIMEOUT_MS,
-                        onTotal = { total = it },
-                        cancelled = cancelled,
-                        onChunk = { buf, off, len ->
-                            out.write(buf, off, len)
-                            written += len
-                            report(written)
-                        },
-                    )
+                while (written < stat.size && !cancelled()) {
+                    withSegment {
+                        if (!cancelled()) {
+                            val segmentLength = OriginalTransferSegments.length(stat.size, written)
+                            val ticket = client.getObject(path, PtpCodec.KIND_ORIGINAL, written, segmentLength)
+                            var yielded = false
+                            val segmentCancelled = {
+                                cancelled() || yieldForPreview().also { if (it) yielded = true }
+                            }
+                            val received = DataChannel(
+                                host = host,
+                                filePort = ticket.filePort,
+                                guid16 = IdentityRepo.guid16(),
+                                connNo = client.connNo,
+                                socketFactory = socketFactoryOrNull(),
+                            ).use { ch ->
+                                ch.download(
+                                    token = ticket.token,
+                                    expectedTxId = 1,
+                                    expectedBytes = segmentLength.toLong(),
+                                    timeoutMs = IO_TIMEOUT_MS,
+                                    onTotal = { total = it },
+                                    cancelled = segmentCancelled,
+                                    onChunk = { buf, off, len ->
+                                        out.write(buf, off, len)
+                                        written += len
+                                        report(written)
+                                    },
+                                )
+                            }
+                            onProgress(written)
+                            if (!cancelled() && !yielded && (total != segmentLength.toLong() || received != total)) {
+                                throw IOException("原图分段传输不完整（收到 $received / $segmentLength 字节）")
+                            }
+                        }
+                    }
                 }
                 // 收尾补一次：合并之后最后一小截可能没够阈值，进度条要落到终点
                 onProgress(written)
 
                 val pumpResult = when {
                     cancelled() -> PumpResult.CANCELLED
-                    total >= 0 && received == total -> PumpResult.COMPLETED
+                    written == stat.size -> PumpResult.COMPLETED
                     else -> {
-                        Log.d(TAG, "pump 短收: received=$received total=$total")
+                        transferFailures[path] = "原图传输不完整（收到 $written / ${stat.size} 字节）"
+                        Log.d(TAG, "pump 短收: written=$written size=${stat.size}")
                         PumpResult.FAILED
                     }
                 }
                 // ★ 2.7.0 提速诊断：本条原图传输的端到端速率（见上面 beganAt 的说明）
-                logRate("pump ${path}", (received - startOffset).toInt(),
+                logRate("pump ${path}", (written - startOffset).toInt(),
                     android.os.SystemClock.elapsedRealtime() - beganAt)
                 pumpResult
             }.get()
         } catch (e: Exception) {
+            val cause = e.cause ?: e
+            transferFailures[path] = "原图传输失败：${cause.message ?: cause.javaClass.simpleName}"
             Log.d(TAG, "pump failed: ${e.message}")
             if (cancelled()) PumpResult.CANCELLED else PumpResult.FAILED
         }

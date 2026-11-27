@@ -74,7 +74,7 @@ class DataChannel(
         s.connect(InetSocketAddress(host, filePort), timeoutMs)
         socket = s
 
-        val input = s.getInputStream()
+        val input = CameraReceiveMeter.input(s.getInputStream())
         val output = s.getOutputStream()
 
         // ⚠ 这里**故意不复用**收包缓冲（曾经复用过一次，是个真 bug，记在这儿免得再犯）：
@@ -203,7 +203,7 @@ class DataChannel(
             s.connect(InetSocketAddress(host, filePort), timeoutMs)
             socket = s
         }
-        val input = s.getInputStream()
+        val input = CameraReceiveMeter.input(s.getInputStream())
         val output = s.getOutputStream()
         // ★ 审修复（H2）：done 提到 try 外 —— finally 要按"整批是否收完"决定连接去留。
         var done = 0

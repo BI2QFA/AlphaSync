@@ -314,31 +314,8 @@ fun MsIcon(
     //    上面那个 Typeface 缓存压力只剩 wght 一条路。
     val weightQ = quantize(weight, WEIGHT_STEPS)
 
-    val baseFamily = remember(weightQ) {
-        FontFamily(
-            Font(
-                resId = R.font.ms_icons,
-                variationSettings = FontVariation.Settings(
-                    FontVariation.weight(weightQ.toInt()),
-                    // opsz 固定在中性值：它影响笔画对比度，跟着字号变会让同一枚图标
-                    // 在不同尺寸下看着不是同一个图标
-                    FontVariation.Setting("opsz", OPSZ),
-                ),
-            ),
-        )
-    }
-    // FILL=1 实例：wght/opsz 与上面同一口径，两支的笔画粗细逐帧一致
-    val fillFamily = remember(weightQ) {
-        FontFamily(
-            Font(
-                resId = R.font.ms_icons_fill,
-                variationSettings = FontVariation.Settings(
-                    FontVariation.weight(weightQ.toInt()),
-                    FontVariation.Setting("opsz", OPSZ),
-                ),
-            ),
-        )
-    }
+    val baseFamily = remember { FontFamily(Font(R.font.ms_icons_static)) }
+    val fillFamily = remember { FontFamily(Font(R.font.ms_icons_fill_static)) }
 
     val glyph = remember(icon) { String(Character.toChars(icon.codePoint)) }
     // ★ 用 `Density.toSp(Dp)` 而不是 `size.value.sp`：后者是"把 dp 数值当 sp 用"，

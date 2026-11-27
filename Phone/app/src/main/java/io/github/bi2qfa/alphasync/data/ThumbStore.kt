@@ -51,6 +51,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * </ul>
  */
 object ThumbStore {
+    // v22: active queues request KIND_PREVIEW only. A decoded full preview is
+    // the prerequisite for publishing a derived list thumbnail; older thumbnail
+    // files are excluded by the .derived.jpg cache namespace.
 
     enum class ThumbState { NONE, LOADING, READY, FAILED }
 
@@ -126,36 +129,11 @@ object ThumbStore {
      */
     private const val AUTO_CONCURRENCY = 1
 
-    /**
-     * 无感通道 **小图批大小**（★ 2.11-fix：从原 `AUTO_BATCH_K` 拆出，小图/预览各自独立）。
-     *
-     * <p>为什么批量：实测每对象的固定成本 = 控制往返 + TCP 建连/慢启动 + DATA_OPEN
-     * 往返；且 3~4 条并发流在 2.4GHz 弱电台上互相争抢，聚合反而**低于**单流。
-     * 批量把固定开销摊销到 K 项上，让数据面回到单流。**回退开关**：改 1 = 逐项老路径。
-     *
-     * <p>取 16 的依据：无感通道的并发是 [AUTO_CONCURRENCY] = 1（同时只有**一批**在飞），
-     * "一批装多少项"就是这条通道唯一的在飞水位杠杆；相机端**逐张流式**下发
-     * （`PtpIpServer.transferBatch` 按 txId 对账），首项仍在单张解析（相机上 ~88ms）
-     * 后到达，**不增加首屏延迟**。内存 16 × ~6.4KB ≈ 100KB，可忽略。
-     */
-    private const val SEAMLESS_THUMB_K = 16
+    /** Small batches bound camera work and keep live/manual requests responsive. */
+    private const val SEAMLESS_THUMB_K = 8
 
-    /**
-     * 无感通道 **大预览批大小**（★ 2.11-fix：8 → **16**，用户要求"适当增加预览图批量单组数量"）。
-     *
-     * <p>为什么能加：批内每张仍在**同一条连接**上逐张流式下发（首项不因批大而变慢），
-     * 加大只是把"批间空隙"（让位窗口检查、[bulkGate] 获取、批调度）摊得更薄 ——
-     * 收益递减但方向正确。
-     *
-     * <p>已核实的两个边界：
-     * <ul>
-     *   <li><b>不闸住"点开大图"</b>：用户实时取件（[fetchPreviewBlocking]）**不经过**
-     *       [bulkGate]，不会被预取批堵在闸外；只是空口上与预取批竞争。</li>
-     *   <li><b>内存</b>：16 × ~400KB ≈ 6.4MB 进 [writeQueue]，可接受。</li>
-     * </ul>
-     * 代价：单批在飞时间变长（16 × 相机端 ~350ms/张 ≈ 5.6s）—— 属预取，用户不直接等它。
-     */
-    private const val SEAMLESS_PREVIEW_K = 16
+    /** Two previews per batch bound the wait for a foreground preview. */
+    private const val SEAMLESS_PREVIEW_K = 2
 
     /**
      * 小图通道**批大小**（2.7.0 批量流式）。
@@ -303,6 +281,14 @@ object ThumbStore {
      * 而不是批内排序。两队列与旧 [autoQueue] 无关（旧容器保留待 B 阶段清理）。
      */
     private val thumbQueue = ArrayDeque<ObjectCacheKey>()      // 阶段 A：小图
+    private val latestPriority = LivePreviewPriority<ObjectCacheKey> { it.token }
+    private val directoryPriority = LivePreviewPriority<ObjectCacheKey> { it.token }
+    private var focusedDirectory = "/"
+    private val visiblePriority = LivePreviewPriority<ObjectCacheKey> { it.token }
+    private var visibleOwner: Any? = null
+    private var visibleKeys: List<ObjectCacheKey> = emptyList()
+    private var visibleDevice: String? = null
+    private val livePriority = LivePreviewPriority<ObjectCacheKey> { it.token }
     private val previewQueue = ArrayDeque<ObjectCacheKey>()    // 阶段 B：大预览
     private val thumbQueuedSet = HashSet<String>()             // 去重（token）
     private val previewQueuedSet = HashSet<String>()
@@ -344,7 +330,8 @@ object ThumbStore {
      * 实测：25MB 单流 2.23MB/s，而 3~4 条并发流聚合反而掉到 ~0.9MB/s（弱电台上
      * 多流互相争抢/重传）。批量 + 单流闸让链路跑在单流最优点上。
      */
-    private val bulkGate = java.util.concurrent.Semaphore(1)
+    private val bulkGate = PreviewTransferGate()
+    @Volatile private var automaticRetryAfterMs = 0L
 
     /** 待落盘项（[batchWriteLoop] 消费）。 */
     private class PendingWrite(val key: ObjectCacheKey, val kind: Int, val bytes: ByteArray)
@@ -365,14 +352,17 @@ object ThumbStore {
      * 这里按 (token, kind) 登记在途写，另一条通道的重查把它当"已满足"。
      */
     private val pendingWrites = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    private val pendingPreviewBundles = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
 
     private fun writeId(key: ObjectCacheKey, kind: Int): String = key.token + "#" + kind
 
-    private fun markPendingWrite(key: ObjectCacheKey, kind: Int) {
+    private fun markPendingWrite(key: ObjectCacheKey, kind: Int, bytes: ByteArray) {
+        if (kind == PtpCodec.KIND_PREVIEW) pendingPreviewBundles[key.token] = bytes
         pendingWrites[writeId(key, kind)] = true
     }
 
     private fun clearPendingWrite(key: ObjectCacheKey, kind: Int) {
+        if (kind == PtpCodec.KIND_PREVIEW) pendingPreviewBundles.remove(key.token)
         pendingWrites.remove(writeId(key, kind))
     }
 
@@ -388,39 +378,24 @@ object ThumbStore {
         while (true) {
             val w = runCatching { writeQueue.take() }.getOrNull() ?: continue
             try {
-                if (w.kind == PtpCodec.KIND_THUMB) {
-                    // ★ 小图 = 捆绑包 [4B 大端 JSON 长][JSON][JPEG]（唯一格式；解不出即 FAILED）
-                    // 先 sidecar 后解码：learnOrientation 先行，第一帧就按新方向转正
-                    val bundle = splitPreviewBundle(w.bytes)
-                    if (bundle == null) {
-                        states[w.key.token] = ThumbState.FAILED
-                        continue
-                    }
-                    val (jpg, json) = bundle
-                    writeThumbExifSidecar(w.key, json)
-                    val bmp = runCatching { decodeSmallKeyed(jpg, w.key) }.getOrNull()
-                    if (bmp == null) {
-                        states[w.key.token] = ThumbState.FAILED
-                        continue
-                    }
-                    memoryCache.put(w.key.token, bmp)
-                    runCatching {
-                        atomicWrite(smallDiskFile(w.key), jpg)   // 磁盘仍存纯 JPEG：格式不变、好回滚
-                        // 条数闸已取消（见类顶部说明）：容量只由字节总闸 + 预算闸管
-                        noteWritten(jpg.size)                    // 记账用小图大小（不含 JSON）
-                    }
-                    states[w.key.token] = ThumbState.READY
-                } else {
-                    runCatching {
-                        // 捆绑包拆开：JPEG 进预览缓存，EXIF JSON 进 sidecar
-                        //（sidecar 一到 writeExifSidecar 就发方向信号 → 小图跟着转正）
-                        val bundle = splitPreviewBundle(w.bytes) ?: return@runCatching
-                        val (jpg, json) = bundle
-                        atomicWrite(previewDiskFile(w.key), jpg)
-                        writeExifSidecar(w.key, json)
-                        noteWritten(jpg.size)
-                    }
+                if (w.kind != PtpCodec.KIND_PREVIEW) continue
+                val bundle = splitPreviewBundle(w.bytes)
+                if (bundle == null) { states[w.key.token] = ThumbState.FAILED; continue }
+                val (jpg, json) = bundle
+                learnOrientation(w.key, orientationIn(json))
+                val bmp = previewMemory.get(w.key.token) ?: decodePreviewBytes(jpg, orientationIn(json))
+                if (bmp == null) { states[w.key.token] = ThumbState.FAILED; continue }
+                publishPreview(w.key, bmp)
+                atomicWrite(previewDiskFile(w.key), jpg)
+                writeExifSidecar(w.key, json)
+                val small = memoryCache.get(w.key.token) ?: continue
+                val out = java.io.ByteArrayOutputStream()
+                if (small.compress(Bitmap.CompressFormat.JPEG, 95, out)) {
+                    val derived = out.toByteArray()
+                    atomicWrite(smallDiskFile(w.key), derived)
+                    noteWritten(derived.size)
                 }
+                noteWritten(jpg.size)
             } catch (t: Throwable) {
                 android.util.Log.w("ThumbStore", "batch write failed", t)
             } finally {
@@ -515,6 +490,11 @@ object ThumbStore {
      * 自动淘汰，miss 时 [smallThumb] 从磁盘缓存读并回填。功能与内存都安全，属预期行为，
      * **不需要**跟着调大（调大只会挤占其余内存，淘汰本就是它的职责）。
      */
+    /** Recent full previews retain decoded pixels; no extra decoding when reopening. */
+    private val previewMemory = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
     private val memoryCache = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
     }
@@ -681,6 +661,31 @@ object ThumbStore {
 
     // ===== 传输暂停联动 =====
 
+    @Volatile var remoteControlActive = false
+    @Volatile private var automaticHasWork = false
+    var downloadWaitingForPreview by mutableStateOf(false)
+        private set
+
+    fun previewsNeedChannel(): Boolean = synchronized(lock) {
+        PreviewChannelPolicy.shouldYield(
+            foreground = bulkGate.foregroundPending,
+            urgentQueued = livePriority.hasQueued(thumbQueuedSet) || livePriority.hasQueued(previewQueuedSet) ||
+                visiblePriority.hasQueued(thumbQueuedSet) || visiblePriority.hasQueued(previewQueuedSet),
+            budgetPaused = cacheBudgetPaused,
+            retryCoolingDown = android.os.SystemClock.elapsedRealtime() < automaticRetryAfterMs,
+        )
+    }
+
+    /** Live/manual previews preempt originals; historical batches share the fair channel gate. */
+    fun withDownloadSegment(block: () -> Unit, priority: () -> Boolean = { false }, cancelled: () -> Boolean) {
+        try {
+            bulkGate.withOriginal(
+                shouldYield = { (remoteControlActive || (!priority() && previewsNeedChannel())).also { downloadWaitingForPreview = it } },
+                cancelled = cancelled, block = block,
+            )
+        } finally { downloadWaitingForPreview = false }
+    }
+
     fun pauseForTransfer() {
         pausedAtMs = android.os.SystemClock.elapsedRealtime()
         paused = true
@@ -753,64 +758,128 @@ object ThumbStore {
     /** 取小图位图（**阻塞，须在 IO 线程**）：内存 → 磁盘解码 → 回填内存。 */
     fun smallThumb(key: ObjectCacheKey): ImageBitmap? {
         memoryCache.get(key.token)?.let { return it.asImageBitmap() }
-        val f = smallDiskFile(key)
-        if (f.isFile) {
-            // ★ 2.7.0 需求 7：小图字节里没有 EXIF，方向来自大预览 sidecar
-            val bmp = runCatching { decodeFileOriented(f) }.getOrNull()
-                ?.let { rotateByOrientation(it, orientationOf(key)) }
-            if (bmp != null) {
-                memoryCache.put(key.token, bmp)
-                return bmp.asImageBitmap()
+        val small = smallDiskFile(key)
+        if (small.isFile) {
+            // Derived thumbnails already have the full preview's orientation.
+            BitmapFactory.decodeFile(small.absolutePath)?.let {
+                memoryCache.put(key.token, it)
+                states[key.token] = ThumbState.READY
+                return it.asImageBitmap()
             }
-            // 解码失败 = 这个缓存文件坏了（半截/被外部改坏）。删掉它，让调用方
-            // 的下一轮 request 走网络回源；留着的话每次点开都先白试一遍解码。
-            runCatching { f.delete() }
-            // ★ 缓存识别修复：文件已删，READY 状态必须撤销 —— 否则"标了 READY
-            //   但文件不存在"会卡住占位图（request() 见 READY 就跳过），只能靠重启。
-            //   置 FAILED 后：占位可见，且下一次 request() 会重新入队自愈。
-            if (states[key.token] == ThumbState.READY) {
-                states[key.token] = ThumbState.FAILED
-            }
-        } else if (states[key.token] == ThumbState.READY) {
-            // ★ 2.11-fix（自愈补齐）：磁盘文件**整个不见了** —— 典型来源是字节预算 LRU
-            //   修剪（[pruneAll] 只删文件、**不动 [states]**），或 [atomicWrite] 半途失败。
-            //   内存里也没有（上面 miss）→ 这条 READY 是**假的**。撤销它。
-            //   不撤销的后果：`request()` 见 READY 就 `continue` → 这张图**永久空白**，
-            //   只有重连/清缓存才回来（用户症状正是"有的照片一直不出图"）。
-            //   置 FAILED 后由 `request()` 重排自愈（见那里的 ★ 2.11-fix 说明）。
-            states[key.token] = ThumbState.FAILED
+            small.delete()
         }
+        val full = previewMemory.get(key.token) ?: previewDiskFile(key).takeIf { it.isFile }?.let {
+            runCatching {
+                val orientation = orientationOf(key)
+                if (orientation in 1..8) BitmapFactory.decodeFile(it.absolutePath)
+                    ?.let { bmp -> rotateByOrientation(bmp, orientation) }
+                else decodeFileOriented(it)
+            }.getOrNull().also { bmp -> if (bmp == null) it.delete() }
+        }
+        if (full != null) {
+            publishPreview(key, full)
+            return memoryCache.get(key.token)?.asImageBitmap()
+        }
+        if (states[key.token] == ThumbState.READY) states[key.token] = ThumbState.FAILED
         return null
     }
 
-    /** 全屏大预览：磁盘缓存 → PTP/IP 拉取（阻塞，须在 IO 线程） */
-    fun fetchPreviewBlocking(key: ObjectCacheKey): ImageBitmap? {
-        // 用户点开的"注意力信号"（自动队列让位用）：入口就记，不区分命不命中。
-        userOpenAt = android.os.SystemClock.elapsedRealtime()
-        val f = previewDiskFile(key)
-        if (f.isFile) {
-            val bmp = runCatching { decodeFileOriented(f) }.getOrNull()
-            // ★ 2.7.0 需求 6：按 sidecar 的方向自动转正（缓存 jpg 自身没有 EXIF）
-            if (bmp != null) return rotateByOrientation(bmp, orientationOf(key)).asImageBitmap()
-            runCatching { f.delete() }     // 坏缓存文件：删掉回源（见 smallThumb 同款说明）
-        }
-        val h = host ?: io.github.bi2qfa.alphasync.core.ConnectionCenter.host ?: return null
-        val bytes = ObjectRepository.fetchVirtualPreview(h, key.path) ?: return null
-        // ★ 预览是捆绑包（JPEG + EXIF JSON）——拆开后各写各的，解码只用 JPEG 段；
-        //   解不出捆绑包 → 本次取预览失败（唯一格式，无兜底）
-        val bundle = splitPreviewBundle(bytes) ?: return null
-        val (jpg, json) = bundle
-        runCatching {
-            atomicWrite(f, jpg)
-            writeExifSidecar(key, json)
-            noteWritten(jpg.size)
-        }
-        val bmp = decodeOriented(jpg) ?: return null
-        return rotateByOrientation(bmp, orientationOf(key)).asImageBitmap()
+    private fun publishPreview(key: ObjectCacheKey, bmp: Bitmap) {
+        previewMemory.put(key.token, bmp)
+        val (width, height) = PreviewThumbnailPolicy.dimensions(bmp.width, bmp.height)
+        val small = if (width == bmp.width && height == bmp.height)
+            bmp.copy(Bitmap.Config.ARGB_8888, false)
+        else Bitmap.createScaledBitmap(bmp, width, height, true)
+        memoryCache.put(key.token, small)
+        previewErrors.remove(key.token)
+        states[key.token] = ThumbState.READY
     }
 
+    fun retryPreview(key: ObjectCacheKey) {
+        synchronized(lock) {
+            autoRetryCount.remove(key.token)
+            previewErrors.remove(key.token)
+            states[key.token] = ThumbState.LOADING
+            automaticRetryAfterMs = 0L
+            if (previewQueuedSet.add(key.token)) previewQueue.addFirst(key)
+            lock.notifyAll()
+        }
+    }
+
+    /** 全屏大预览：磁盘缓存 → PTP/IP 拉取（阻塞，须在 IO 线程） */
+    private val previewErrors = java.util.concurrent.ConcurrentHashMap<String, String>()
+    fun previewError(key: ObjectCacheKey): String? = previewErrors[key.token]
+
+    fun fetchPreviewBlocking(key: ObjectCacheKey): ImageBitmap? {
+        previewErrors.remove(key.token)
+        val f = previewDiskFile(key)
+        fun remember(bmp: Bitmap): ImageBitmap {
+            publishPreview(key, bmp)
+            return bmp.asImageBitmap()
+        }
+        fun cached(): ImageBitmap? {
+            previewMemory.get(key.token)?.let { return it.asImageBitmap() }
+            // Bytes already received by automatic prefetch are usable before disk writes finish.
+            pendingPreviewBundles[key.token]?.let { bytes ->
+                splitPreviewBundle(bytes)?.let { (jpg, json) ->
+                    decodePreviewBytes(jpg, orientationIn(json))?.let { return remember(it) }
+                }
+            }
+            if (!f.isFile) return null
+            val orientation = orientationOf(key)
+            val bmp = runCatching {
+                if (orientation in 1..8) {
+                    BitmapFactory.decodeFile(f.absolutePath)?.let { rotateByOrientation(it, orientation) }
+                } else decodeFileOriented(f)
+            }.getOrNull()
+            if (bmp != null) return remember(bmp)
+            runCatching { f.delete() }
+            return null
+        }
+        cached()?.let { return it }
+        userOpenAt = android.os.SystemClock.elapsedRealtime()
+        return try { bulkGate.withForeground {
+            // The in-flight background batch may already have supplied this image.
+            var waits = 0
+            while (waits++ < 5 && isPendingWrite(key, PtpCodec.KIND_PREVIEW) && !f.isFile) {
+                cached()?.let { return@withForeground it }
+                Thread.sleep(50)
+            }
+            cached()?.let { return@withForeground it }
+            val h = io.github.bi2qfa.alphasync.core.ConnectionCenter.host ?: run {
+                previewErrors[key.token] = "相机连接已断开"
+                return@withForeground null
+            }
+            repeat(2) { attempt ->
+                val bytes = ObjectRepository.fetchVirtualPreview(h, key.path)
+                val bundle = bytes?.let { splitPreviewBundle(it) }
+                previewErrors[key.token] = when {
+                    bytes == null -> ObjectRepository.lastPreviewFailure() ?: "相机预览请求失败"
+                    bundle == null -> "预览数据格式无效（${bytes.size} 字节）"
+                    else -> "预览 JPEG 无法解码（${bundle.first.size} 字节）"
+                }
+                if (bundle != null && bytes != null) {
+                    val (jpg, json) = bundle
+                    val bmp = decodePreviewBytes(jpg, orientationIn(json))
+                    if (bmp != null) {
+                        // Show the decoded image now; use the existing writer for disk persistence.
+                        learnOrientation(key, orientationIn(json))
+                        markPendingWrite(key, PtpCodec.KIND_PREVIEW, bytes)
+                        writeQueue.put(PendingWrite(key, PtpCodec.KIND_PREVIEW, bytes))
+                        previewErrors.remove(key.token)
+                        return@withForeground remember(bmp)
+                    }
+                }
+                if (attempt == 0) Thread.sleep(200)
+            }
+            null
+        } } finally {
+            userOpenAt = 0L
+            synchronized(lock) { lock.notifyAll() }
+        }
+    }
     private fun smallDiskFile(key: ObjectCacheKey) =
-        File(smallDiskDir, cacheKey(key.token) + ".jpg")
+        File(smallDiskDir, cacheKey(key.token) + ".derived.jpg")
 
     private fun previewDiskFile(key: ObjectCacheKey) =
         File(previewDiskDir, cacheKey(key.token) + ".jpg")
@@ -877,6 +946,7 @@ object ThumbStore {
             // 小图内存里那份可能是旧方向的：evict 让它按新方向重解；
             // epoch 让 UI（FilesScreen 两个缩略图调用点）重画。
             memoryCache.remove(key.token)
+            previewMemory.remove(key.token)
             orientationEpoch++
         }
     }
@@ -1130,7 +1200,7 @@ object ThumbStore {
             autoQueue.clear(); autoQueuedSet.clear()
             // ★ 2.10：两段式队列同清（"清缓存"= 队列状态复位；随后 restartAutoFetch 全量重建）
             thumbQueue.clear(); thumbQueuedSet.clear()
-            previewQueue.clear(); previewQueuedSet.clear()
+            previewQueue.clear(); previewQueuedSet.clear(); livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
             seamlessPhase = FetchPhase.IDLE
             batchDone = 0; batchTotal = 0
             autoDone = 0; autoTotal = 0
@@ -1143,12 +1213,15 @@ object ThumbStore {
         pendingWrites.clear()
         thumbBusy = false
         autoBusy = false
+        automaticHasWork = false
         // O2 恢复路径：缓存清空 → 账归零、解除预算暂停
         bytesSinceCalibration.set(0)
         baseCacheBytes = 0L
         applyCacheBudgetPaused(false)
         states.clear()
         memoryCache.evictAll()
+        previewMemory.evictAll()
+        pendingPreviewBundles.clear()
         orientCache.clear()
         orientationEpoch++   // 方向随缓存归零：发信号让 UI 重画（未转正的原始朝向）
         runCatching { smallDiskDir.deleteRecursively() }
@@ -1169,6 +1242,7 @@ object ThumbStore {
             thumbQueuedSet.clear()
             previewQueue.clear()
             previewQueuedSet.clear()
+            livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
             seamlessPhase = FetchPhase.IDLE
             batchDone = 0
             batchTotal = 0
@@ -1177,6 +1251,7 @@ object ThumbStore {
             autoGen++          // 断开重连：在途的自动/无感条目作废（见 autoFetchLoop）
             paused = false
             pausedAtMs = 0L
+            automaticRetryAfterMs = 0L
             // ★ F7（2.6 修复）：**清掉 host** —— 旧实现只清队列，断连后旧相机的
             //   地址仍留在 host 里；重连到另一台相机（或同一台换会话）时，
             //   小图/自动批会拿着过期 host 去拉（`processThumbBatch` 里
@@ -1191,11 +1266,14 @@ object ThumbStore {
         }
         states.clear()
         memoryCache.evictAll()
+        previewMemory.evictAll()
+        pendingPreviewBundles.clear()
         thumbRetryCount.clear()
         autoRetryCount.clear()
         pendingWrites.clear()
         thumbBusy = false
         autoBusy = false
+        automaticHasWork = false
         applyCacheBudgetPaused(false)    // O2：新会话按预算重新评估（缓存文件本身保留）
         lastWarmupKeys = emptyList()   // 断开：名单作废，restartAutoFetch 会走"清空"分支
         warmupPaths = emptySet()       // ★ 2.11-fix：名单在册索引同步作废（见 request 分流）
@@ -1334,7 +1412,7 @@ object ThumbStore {
                             if (bytes == null || di !in dlIdx.indices) return@downloadBatch
                             // ★ 2.7.0：解码/写盘挪到 [batchWriteLoop]，收包线程立刻回去收下一项
                             //   （put 在标记 done 之前：put 抛异常时该项按"未交付"进重试）
-                            markPendingWrite(dlKeys[di], PtpCodec.KIND_THUMB)
+                            markPendingWrite(dlKeys[di], PtpCodec.KIND_THUMB, bytes)
                             writeQueue.put(PendingWrite(dlKeys[di], PtpCodec.KIND_THUMB, bytes))
                             done[dlIdx[di]] = true
                         }
@@ -1507,6 +1585,7 @@ object ThumbStore {
             thumbQueuedSet.clear()
             previewQueue.clear()
             previewQueuedSet.clear()
+            livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
             seamlessPhase = FetchPhase.IDLE
             autoTotal = 0
             autoDone = 0
@@ -1519,6 +1598,7 @@ object ThumbStore {
         //   [request] 之后会走"名单外插队头"那一支，小图不会没人拉。
         warmupPaths = emptySet()
         autoBusy = false
+        automaticHasWork = false
     }
 
     /** 非阻塞取一条自动任务：队列空或暂停中返回 null（等待逻辑在 [autoFetchLoop] 调度器里）。 */
@@ -1559,10 +1639,16 @@ object ThumbStore {
         // 只有本线程做"入飞"，inFlight.size 判定无竞争；完成由批线程自己摘除。
         val inFlight = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.Future<*>>()
         while (true) {
+            // A fast cached batch may finish before its Future is inserted into this map.
+            // Remove completed futures so downloads cannot remain paused on stale work.
+            for ((id, task) in inFlight.entries) {
+                if (task.isDone) inFlight.remove(id, task)
+            }
             // F1 连带：UI 的"是否仍在推进"信号（进度只计成功后不能再拿 done<total 判定）
             // ★ 2.10：推进信号改看无感两段队列（旧 autoQueue 已不参与取件）
             autoBusy = inFlight.isNotEmpty() ||
                 synchronized(lock) { thumbQueue.isNotEmpty() || previewQueue.isNotEmpty() }
+            automaticHasWork = autoBusy
             if (inFlight.size >= AUTO_CONCURRENCY) {
                 Thread.sleep(10)                       // 在飞满：等一个批收尾腾位
                 continue
@@ -1579,6 +1665,10 @@ object ThumbStore {
                 continue
             }
             applyCacheBudgetPaused(false)
+            if (bulkGate.foregroundPending) {
+                synchronized(lock) { runCatching { lock.wait(100) } }
+                continue
+            }
             // ===== 让位窗口：窗口内不放新批（在飞的照常收场） =====
             val rest = YIELD_WAIT_MS - (android.os.SystemClock.elapsedRealtime() - userOpenAt)
             if (rest > 0) {
@@ -1598,15 +1688,19 @@ object ThumbStore {
             val batch = ArrayList<ObjectCacheKey>(
                 if (SEAMLESS_PREVIEW_K > SEAMLESS_THUMB_K) SEAMLESS_PREVIEW_K else SEAMLESS_THUMB_K,
             )
+            var batchPriority = 0
             var batchKind = 0
             var batchK = SEAMLESS_THUMB_K
             while (batch.size < batchK) {
                 val polled = pollSeamless() ?: break
                 val (k, kind) = polled
+                // Both demand queues may contain this file; consume it only once per batch.
+                if (batch.any { it.token == k.token }) continue
                 if (batch.isEmpty()) {
+                    batchPriority = priorityOf(k)
                     batchKind = kind
                     batchK = if (kind == PtpCodec.KIND_PREVIEW) SEAMLESS_PREVIEW_K else SEAMLESS_THUMB_K
-                } else if (kind != batchKind) {
+                } else if (kind != batchKind || batchPriority != priorityOf(k)) {
                     pushBackSeamless(polled)
                     break
                 }
@@ -1620,7 +1714,16 @@ object ThumbStore {
             //   原实现无条件 `sortBy { it.path }`（升序），而队列是"新→旧"（path 降序），
             //   于是每一批都被**翻成老→新**：每 K 张一组、组内倒序，用户看到的就是
             //   "加载顺序像随机"。方向感知后组内顺序 = 列表顺序，且仍是连续文件名。
-            orderBatchForSd(batch)
+            if (batchPriority == 4) {
+                // Already in visible-cell order; neither time nor JPG pairing may reorder it.
+            } else if (batchPriority > 0) {
+                batch.sortWith(compareByDescending<ObjectCacheKey> { it.mtime }.thenByDescending { it.path })
+            } else {
+                orderBatchForSd(batch)
+            }
+            val jpgFirst = if (batchPriority == 4) batch.toList() else JpgPreviewOrder.order(batch) { it.path }
+            batch.clear()
+            batch.addAll(jpgFirst)
             seamlessPhase =
                 if (batchKind == PtpCodec.KIND_PREVIEW) FetchPhase.PREVIEWS else FetchPhase.SWEEP
             val id = "b" + batch[0].token
@@ -1718,7 +1821,7 @@ object ThumbStore {
                                     if (bytes == null || di !in dl.indices) return@downloadBatch
                                     // ★ 2.7.0：解码/写盘挪到 [batchWriteLoop]（见 [writeQueue] 说明）
                                     //   （put 在标记 done 之前：put 抛异常时该项按"未交付"进重试）
-                                    markPendingWrite(reqKeys[dl[di]], reqKinds[dl[di]])
+                                    markPendingWrite(reqKeys[dl[di]], reqKinds[dl[di]], bytes)
                                     writeQueue.put(PendingWrite(reqKeys[dl[di]], reqKinds[dl[di]], bytes))
                                     done[dl[di]] = true
                                 }
@@ -1751,6 +1854,7 @@ object ThumbStore {
             synchronized(lock) {
                 if (autoGen == gen) {
                     for (tok in successTokens) countAutoLocked(tok)
+
                 }
             }
         }
@@ -1790,6 +1894,12 @@ object ThumbStore {
             thumbQueuedSet.clear()
             previewQueue.clear()
             previewQueuedSet.clear()
+            livePriority.clear(); directoryPriority.clear(); latestPriority.clear(); visiblePriority.clear()
+            if (visibleOwner != null && visibleDevice == io.github.bi2qfa.alphasync.core.ConnectionCenter.displayGuid()) {
+                visiblePriority.mark(visibleKeys)
+                visiblePriority.promote(visibleKeys, thumbQueue, thumbQueuedSet, ::thumbOnDisk)
+                visiblePriority.promote(visibleKeys, previewQueue, previewQueuedSet, ::previewOnDisk)
+            }
             countedAuto.clear()
             autoTotal = keys.size      // 仅记账（A3 后无 UI 消费，日志用）
             autoDone = 0
@@ -1799,9 +1909,21 @@ object ThumbStore {
         }
         // 排序：**新→旧**（列表上方优先；同 mtime 按文件名倒序稳定化）——
         // 用户定版"预取遵循列表排序、从列表上方开始"，默认序即新→旧。
-        val sorted = keys.sortedWith(
-            compareByDescending<ObjectCacheKey> { it.mtime }.thenByDescending { it.path },
-        )
+        val preferred = SettingsRepo.lastDirectory()
+        val photos = keys.map { PhotoWarmupOrder.Photo(it.path, it.mtime) }
+        val latest = PhotoWarmupOrder.latestDirectory(photos)
+        synchronized(lock) {
+            focusedDirectory = preferred
+            directoryPriority.mark(keys.filter {
+                DirectoryPreference.containsFile(preferred, it.path) && (!thumbOnDisk(it) || !previewOnDisk(it))
+            })
+            latestPriority.mark(keys.filter {
+                it.path.substringBeforeLast('/') == latest && (!thumbOnDisk(it) || !previewOnDisk(it))
+            })
+        }
+        val sortedPaths = PhotoWarmupOrder.order(photos, latest, preferred).map { it.path }
+        val byPath = keys.associateBy { it.path }
+        val sorted = sortedPaths.mapNotNull { byPath[it] }
         // ★ 缓存识别 + 分块落地（沿用既有模式）：**先扫磁盘再建队列** ——
         //   上一次会话已经缓存掉的条目直接标 READY（列表可直接显示）；
         //   小图缺 → [thumbQueue] 尾插、预览缺 → [previewQueue] 尾插。两个判定
@@ -1844,44 +1966,55 @@ object ThumbStore {
         }
     }
 
-    /**
-     * **新照片注入**（★ 2.10，方案 §6.1/§7.2；调用点 = 常驻巡检 / 文件页 diff，见工单 A）。
-     *
-     * <p>语义：**列表上方绝对优先** —— 按入参顺序（= 当时显示序，从上到下）**逆序
-     * pushFront** 到 [thumbQueue]，队头最终 = 列表第一条；当前在飞批**不打断**
-     * （批尾切换），下一批取件（[pollSeamless] 先 thumbQueue）立刻拉这些新照片的小图。
-     *
-     * <p>预览兜底（设计说明）：注入只把小图插到**队头**，同一张的预览**追加到
-     * [previewQueue] 尾部** —— "新照片小图绝对优先"不被破坏（预览在另一队列尾部），
-     * 而它的预览在小图批完成后自然排队（进入预览段），不漏任何一张。
-     *
-     * @param keys 新照片（调用方按显示序传入，队头 = 最上方）
-     */
-    fun injectNew(keys: List<ObjectCacheKey>) {
-        if (keys.isEmpty()) return
+    /** 新照片的两种图都提升到队首；即使已经排队，也重新提升而不重复添加。 */
+    /** Browsing a directory promotes its loaded images without resetting other queues. */
+    fun focusDirectory(path: String, keys: List<ObjectCacheKey>) {
         synchronized(lock) {
-            var added = 0
-            // 小图：**逆序** pushFront —— 逐条插队头后，队头 = 入参第一条（列表最上方）
-            for (i in keys.indices.reversed()) {
-                val key = keys[i]
-                if (thumbOnDisk(key)) continue        // 已缓存：不占队列（快查）
-                if (thumbQueuedSet.add(key.token)) {
-                    thumbQueue.addFirst(key)
-                    added++
-                }
-            }
-            // 预览：**正序**尾插（与小图状态解耦 —— 即便小图已在盘，缺预览也要补；
-            // 追加在尾部 = 不打断"新照片小图优先"，预览段按显示序自然排队）
-            for (key in keys) {
-                if (previewOnDisk(key)) continue      // 已缓存：不占队列（快查）
-                if (previewQueuedSet.add(key.token)) previewQueue.add(key)
-            }
-            autoTotal += added            // 仅记账（日志用）
-            seamlessPhase = FetchPhase.SWEEP   // 注入后回到"小图段"语义
-            lock.notifyAll()              // 唤醒空闲中的调度器
+            focusedDirectory = DirectoryPreference.normalize(path)
+            directoryPriority.clear()
+            val missing = JpgPreviewOrder.order(keys.filter { !thumbOnDisk(it) || !previewOnDisk(it) }) { it.path }
+            directoryPriority.mark(missing)
+            directoryPriority.promote(missing, thumbQueue, thumbQueuedSet, ::thumbOnDisk)
+            directoryPriority.promote(missing, previewQueue, previewQueuedSet, ::previewOnDisk)
+            lock.notifyAll()
         }
     }
 
+    /** Replace the viewport, never accumulate priority for cells scrolled off screen. */
+    fun focusVisible(owner: Any, keys: List<ObjectCacheKey>) {
+        synchronized(lock) {
+            visibleOwner = owner
+            visibleKeys = keys
+            visibleDevice = io.github.bi2qfa.alphasync.core.ConnectionCenter.displayGuid()
+            visiblePriority.clear()
+            visiblePriority.mark(keys)
+            visiblePriority.promote(keys, thumbQueue, thumbQueuedSet, ::thumbOnDisk)
+            visiblePriority.promote(keys, previewQueue, previewQueuedSet, ::previewOnDisk)
+            lock.notifyAll()
+        }
+    }
+
+    fun clearVisible(owner: Any) {
+        synchronized(lock) {
+            if (visibleOwner !== owner) return
+            visiblePriority.clear()
+            visibleOwner = null
+            visibleKeys = emptyList()
+        }
+    }
+
+    fun injectNew(keys: List<ObjectCacheKey>) {
+        if (keys.isEmpty()) return
+        synchronized(lock) {
+            livePriority.mark(keys.filter { !thumbOnDisk(it) || !previewOnDisk(it) })
+            val before = thumbQueuedSet.size
+            livePriority.promote(JpgPreviewOrder.order(keys) { it.path }, thumbQueue, thumbQueuedSet, ::thumbOnDisk)
+            livePriority.promote(JpgPreviewOrder.order(keys) { it.path }, previewQueue, previewQueuedSet, ::previewOnDisk)
+            autoTotal += thumbQueuedSet.size - before
+            seamlessPhase = FetchPhase.SWEEP
+            lock.notifyAll()
+        }
+    }
     /**
      * **预览补漏**（★ 2.10-fix）：把"仍缺预览"的条目补进 [previewQueue]（去重 + 磁盘快查）。
      *
@@ -1930,27 +2063,53 @@ object ThumbStore {
         }
     }
 
-    /**
-     * 无感通道**取件**（★ 2.10）：**小图绝对优先** —— [thumbQueue] 取空才轮到
-     * [previewQueue]；两队列皆空（或暂停中）返回 null。带回 kind 供批组装
-     * （每批只装同一种 kind）。阶段推进免维护：SWEEP → PREVIEWS = thumbQueue 自然取空。
-     *
-     * <p>★ 2.11 第二轮（§3）：暂停**按 kind 放行** —— 同步页在屏（[syncVisible]）时
-     * 小图批照取（用户正盯着同步面板看新照片），预览批仍让位（见函数内注释）。
-     */
+    /** 新照片小图 → 新照片大预览 → 旧小图 → 旧预览；原图下载让位。 */
     private fun pollSeamless(): Pair<ObjectCacheKey, Int>? = synchronized(lock) {
-        // ★ 2.11 第二轮（§3）：**按 kind 放行** —— 同步页在屏时小图批不受传输暂停限制；
-        //   预览批仍让位（大图带宽大，不抢下载）。非同步页维持原语义：暂停挡住全部。
-        val pausedFlag = pausedNow()
-        if (pausedFlag && !syncVisible) return@synchronized null
+        if (remoteControlActive) return@synchronized null
+        // Preview loading continues while original downloads wait for this workload.
+        if (android.os.SystemClock.elapsedRealtime() < automaticRetryAfterMs) return@synchronized null
+        // The screen's order outranks capture time and off-screen live photos.
+        val visible = visiblePriority.poll(thumbQueue, thumbQueuedSet, cached = ::thumbOnDisk)
+            ?: visiblePriority.poll(previewQueue, previewQueuedSet, cached = ::previewOnDisk)
+        if (visible != null) {
+            if (states[visible.token] != ThumbState.READY) states[visible.token] = ThumbState.LOADING
+            return@synchronized (visible to PtpCodec.KIND_PREVIEW)
+        }
+        // Live photos get both image sizes before any historical backlog.
+        val liveThumb = livePriority.poll(thumbQueue, thumbQueuedSet, prefer = { item, queue -> JpgPreviewOrder.preferred(item, queue) { it.path } }, cached = ::thumbOnDisk)
+        if (liveThumb != null) {
+            if (states[liveThumb.token] != ThumbState.READY) states[liveThumb.token] = ThumbState.LOADING
+            return@synchronized (liveThumb to PtpCodec.KIND_PREVIEW)
+        }
+        run {
+            val livePreview = livePriority.poll(previewQueue, previewQueuedSet, prefer = { item, queue -> JpgPreviewOrder.preferred(item, queue) { it.path } }, cached = ::previewOnDisk)
+            if (livePreview != null) return@synchronized (livePreview to PtpCodec.KIND_PREVIEW)
+        }
+        val latestThumb = latestPriority.poll(thumbQueue, thumbQueuedSet, prefer = { item, queue -> JpgPreviewOrder.preferred(item, queue) { it.path } }, cached = ::thumbOnDisk)
+        if (latestThumb != null) {
+            if (states[latestThumb.token] != ThumbState.READY) states[latestThumb.token] = ThumbState.LOADING
+            return@synchronized (latestThumb to PtpCodec.KIND_PREVIEW)
+        }
+        run {
+            val latestPreview = latestPriority.poll(previewQueue, previewQueuedSet, prefer = { item, queue -> JpgPreviewOrder.preferred(item, queue) { it.path } }, cached = ::previewOnDisk)
+            if (latestPreview != null) return@synchronized (latestPreview to PtpCodec.KIND_PREVIEW)
+        }
+        val focusedThumb = directoryPriority.poll(thumbQueue, thumbQueuedSet, prefer = { item, queue -> JpgPreviewOrder.preferred(item, queue) { it.path } }, cached = ::thumbOnDisk)
+        if (focusedThumb != null) {
+            if (states[focusedThumb.token] != ThumbState.READY) states[focusedThumb.token] = ThumbState.LOADING
+            return@synchronized (focusedThumb to PtpCodec.KIND_PREVIEW)
+        }
+        run {
+            val focusedPreview = directoryPriority.poll(previewQueue, previewQueuedSet, prefer = { item, queue -> JpgPreviewOrder.preferred(item, queue) { it.path } }, cached = ::previewOnDisk)
+            if (focusedPreview != null) return@synchronized (focusedPreview to PtpCodec.KIND_PREVIEW)
+        }
         val thumb = pollSkipOnDisk(thumbQueue, thumbQueuedSet) { thumbOnDisk(it) }
         if (thumb != null) {
             // ★ 2.10-fix（修复 2：加载中转圈）：出队小图置 LOADING（与 fetchLoop 同款），
             //   UI 的 st == LOADING 判断才能亮转圈。
             if (states[thumb.token] != ThumbState.READY) states[thumb.token] = ThumbState.LOADING
-            return@synchronized (thumb to PtpCodec.KIND_THUMB)
+            return@synchronized (thumb to PtpCodec.KIND_PREVIEW)
         }
-        if (pausedFlag) return@synchronized null     // 预览批：暂停时让位
         val preview = pollSkipOnDisk(previewQueue, previewQueuedSet) { previewOnDisk(it) }
         if (preview != null) return@synchronized (preview to PtpCodec.KIND_PREVIEW)
         null
@@ -1961,6 +2120,15 @@ object ThumbStore {
      * 放回**它自己队列的头**（去重标记同步恢复），下一批继续 —— 保证每批同 kind，
      * 且队列元素只出不丢。
      */
+    private fun priorityOf(key: ObjectCacheKey): Int = synchronized(lock) {
+        when {
+            visiblePriority.contains(key) -> 4
+            livePriority.contains(key) -> 3
+            latestPriority.contains(key) -> 2
+            directoryPriority.contains(key) -> 1
+            else -> 0
+        }
+    }
     private fun pushBackSeamless(entry: Pair<ObjectCacheKey, Int>) {
         val (key, kind) = entry
         synchronized(lock) {
@@ -2021,6 +2189,7 @@ object ThumbStore {
         val fileOk = BooleanArray(batch.size) { true }
         for (fi in batch.indices) {
             val key = batch[fi]
+            if (kind == PtpCodec.KIND_PREVIEW && onDisk(key, kind)) smallThumb(key)
             if (!onDisk(key, kind)) {
                 reqKeys.add(key)
                 reqOwner.add(fi)
@@ -2066,8 +2235,15 @@ object ThumbStore {
                                     if (bytes == null || di !in dl.indices) return@downloadBatch
                                     // ★ 2.7.0：解码/写盘挪到 [batchWriteLoop]（见 [writeQueue] 说明）
                                     //   （put 在标记 done 之前：put 抛异常时该项按"未交付"进重试）
-                                    markPendingWrite(reqKeys[dl[di]], kind)
-                                    writeQueue.put(PendingWrite(reqKeys[dl[di]], kind, bytes))
+                                    val key = reqKeys[dl[di]]
+                                    val bundle = splitPreviewBundle(bytes) ?: return@downloadBatch
+                                    val bmp = runCatching {
+                                        decodePreviewBytes(bundle.first, orientationIn(bundle.second))
+                                    }.getOrNull() ?: return@downloadBatch
+                                    learnOrientation(key, orientationIn(bundle.second))
+                                    publishPreview(key, bmp)
+                                    markPendingWrite(key, kind, bytes)
+                                    writeQueue.put(PendingWrite(key, kind, bytes))
                                     done[dl[di]] = true
                                 }
                             }
@@ -2079,6 +2255,10 @@ object ThumbStore {
             }
         } catch (t: Throwable) {
             android.util.Log.w("ThumbStore", "seamless batch failed", t)
+        }
+        // Failed batches yield; manual previews bypass this cooldown.
+        if (autoGen == gen && done.any { !it }) {
+            automaticRetryAfterMs = android.os.SystemClock.elapsedRealtime() + 5_000L
         }
         // 逐条目收尾：未交付 → 该条目未就绪
         for (i in reqKeys.indices) {
@@ -2099,6 +2279,14 @@ object ThumbStore {
             synchronized(lock) {
                 if (autoGen == gen) {
                     for (tok in successTokens) countAutoLocked(tok)
+                    if (kind == PtpCodec.KIND_PREVIEW) {
+                        for (fi in batch.indices) if (fileOk[fi]) {
+                            livePriority.forget(batch[fi])
+                            directoryPriority.forget(batch[fi])
+                            latestPriority.forget(batch[fi])
+                        }
+                    }
+
                 }
             }
         }
@@ -2169,6 +2357,13 @@ object ThumbStore {
      * 只在 EXIF 的 Orientation 标记里写"该转 90°/270°"。不解码这一标记，
      * 竖拍照片在界面上就是横躺的。
      */
+    /** Sidecar orientation is authoritative; rotate once and skip redundant EXIF parsing. */
+    private fun decodePreviewBytes(bytes: ByteArray, orientation: Int): Bitmap? {
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        return if (orientation in 1..8) rotateByOrientation(bmp, orientation)
+        else applyExifRotation(bmp, bytes)
+    }
+
     private fun decodeOriented(bytes: ByteArray, sample: Int = 1): Bitmap? {
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null

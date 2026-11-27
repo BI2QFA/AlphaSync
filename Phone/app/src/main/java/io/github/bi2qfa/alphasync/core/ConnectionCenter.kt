@@ -25,6 +25,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 连接状态机：未连接 → 扫描中 → 已连接（PTP/IP 版）。
@@ -67,7 +68,7 @@ object ConnectionCenter {
 
     /** 进软件自动连接：最多试几轮扫描（相机刚开机时 Wi-Fi 还没起来，一轮就报"未找到"太武断） */
     private const val AUTO_CONNECT_ROUNDS = 3
-    private const val AUTO_CONNECT_RETRY_MS = 1500L
+    private const val AUTO_CONNECT_RETRY_MS = 300L
 
     /** 全树扫描时**目录与目录之间**的让出间隔（F6，见 [collectImageEntries]）：让心跳与用户交互不被饿死。 */
     private const val SCAN_DIR_GAP_MS = 50L
@@ -115,6 +116,9 @@ object ConnectionCenter {
     var boundNetwork: Network? = null
         private set
 
+    var connectionProgress by mutableStateOf("")
+        private set
+
     var lastError by mutableStateOf<String?>(null)
         private set
 
@@ -150,8 +154,12 @@ object ConnectionCenter {
         private set
 
     private var heartbeatJob: Job? = null
+    private var linkWatchJob: Job? = null
     private var autoScanJob: Job? = null
     private var autoConnectJob: Job? = null
+    private var recoveryJob: Job? = null
+    var autoReconnecting by mutableStateOf(false)
+        private set
     private lateinit var scope: CoroutineScope
     private var appContext: Context? = null
 
@@ -210,9 +218,9 @@ object ConnectionCenter {
                 PtpCodec.DISC_REASON_PAIRING ->
                     disconnect("相机已进入配对模式，连接已断开")
                 PtpCodec.DISC_REASON_ERROR ->
-                    disconnect("相机服务出现异常，连接已断开")
+                    disconnect("相机服务出现异常，连接已断开", retry = true)
                 else ->
-                    disconnect("相机已断开连接")
+                    disconnect("相机已断开连接", retry = true)
             }
         }
     }
@@ -227,7 +235,7 @@ object ConnectionCenter {
         scope.launch {
             Log.d(TAG, "相机端已退出，收掉当前会话")
             cameraDeclaredDisconnect = true
-            disconnect("相机端已退出")
+            disconnect("相机端已退出", retry = true)
         }
     }
 
@@ -250,7 +258,7 @@ object ConnectionCenter {
             val mode = params?.firstOrNull()
             Log.d(TAG, "相机切换连接方式（mode=$mode）")
             cameraDeclaredDisconnect = true
-            disconnect("相机切换了连接模式，请重新连接")
+            disconnect("相机切换了连接模式，请重新连接", retry = true)
         }
     }
 
@@ -282,7 +290,7 @@ object ConnectionCenter {
                 // ★ 第四批（项2）：两种连接方式统一——立刻收净会话进"重连窗口"
                 //   （断链会同步触发 LiveTransferCenter 的声明驱动重连；主界面
                 //   由 awaitingReconnect 状态立刻切到"正在连接 + 等待重新连接"）。
-                disconnect()
+                disconnect(retry = true)
             }
         }
     }
@@ -309,31 +317,13 @@ object ConnectionCenter {
         this.appContext = context.applicationContext
     }
 
-    // ===== 网络绑定（Wi-Fi + 移动数据双开连接问题的根治） =====
+    // ===== 按相机地址选择 socket 网络 =====
 
     /**
-     * 把相机会话钉到 Wi-Fi 网络：Android/MIUI 会把"无互联网"的相机
-     * Wi-Fi 判为劣质网络，双开时把流量甩到蜂窝 —— 所以要把 socket 与整个进程
-     * 都绑到相机那条链路上。断开时 [unpinNetwork] 解绑。
-     *
-     * <h3>选哪条 Wi-Fi（★ 2026-09-19 修正）</h3>
-     *
-     * 原来只做一件事：**取 `allNetworks` 里第一个 `TRANSPORT_WIFI`**。这在
-     * "手机同时开着相机热点 + 家路由器 Wi-Fi"时会绑错 —— 而这两种网络在我们的
-     * 使用场景里**必然同时存在**（相机热点本身没有互联网，手机通常保留着家里的 Wi-Fi）。
-     * 绑错的表现是探测包发不出去、用户看到"找不到相机"，而相机其实好好的。
-     *
-     * 现在按**目标地址**选：
-     * <ul>
-     *   <li>给了 [targetHost]（连接/重连某台已知相机）→ 逐条 Wi-Fi 网络问
-     *       "这个地址你路由得到吗"，取能路由的那条；</li>
-     *   <li>没给（首次发现/扫描）→ 优先挑**本地地址与某个候选主机同网段**的那条
-     *       （相机热点是 `192.168.122.x` 这种固定私有段），挑不出就退回"第一条 Wi-Fi"。</li>
-     * </ul>
-     * 最后那条回退是必要的：拿不到任何可用信息时，"绑一条 Wi-Fi"总好过"绑到蜂窝"。
-     *
-     * @param targetHost 要连的相机地址；扫描时传 null（那时还不知道目标是哪台）
-     * @param probeHosts 扫描时用于"同网段判断"的候选地址（配对表里记过的相机 IP + 网关）
+     * 仅选择相机 socket 使用的 Wi-Fi Network，不改变进程默认网络。
+     * 有目标地址时只选直连子网匹配的网络；没有匹配则使用系统路由，
+     * 允许访问手机热点下游（通常不作为 Network 暴露）。
+     * 扫描时保留 Wi-Fi 探测，同时由 Discovery 的独立 socket 探测热点。
      */
     private fun pinWifiNetwork(
         context: Context,
@@ -350,10 +340,9 @@ object ConnectionCenter {
                     ) == true
                 }
                 found = when {
-                    // ① 有明确目标：挑"本地地址与目标同 /24"的那条网络
+                    // ① 有明确目标：只选包含该地址的直连子网，不回退到无关 Wi-Fi
                     targetHost != null ->
                         wifiNets.firstOrNull { sameSubnet(it, cm, targetHost) }
-                            ?: wifiNets.firstOrNull()
 
                     // ② 扫描阶段：挑与候选主机同网段的那条（相机热点网段认得出来）
                     probeHosts.isNotEmpty() ->
@@ -362,7 +351,8 @@ object ConnectionCenter {
 
                     else -> wifiNets.firstOrNull()
                 }
-                runCatching { cm.bindProcessToNetwork(found) }
+                // 只为相机 socket 选网络，不绑定整个进程。热点下游通常不在
+                // allNetworks 中；进程绑定上游 Wi-Fi 会连带困住 Discovery 的 raw socket。
             }
             found
         } catch (e: Exception) {
@@ -372,25 +362,23 @@ object ConnectionCenter {
         ObjectRepository.boundNetwork = net
     }
 
-    /**
-     * 这条网络的本地地址与 [host] 是否同 /24。
-     *
-     * <p>为什么用同网段而不是 `canReach()`：`canReach` 依赖系统的路由表判断，
-     * 在"相机热点还没被系统认成可用网络"的那几秒里会返回 false（而那时它恰恰是
-     * 唯一能到相机的链路）。同网段比较只看本地地址，不依赖系统路由状态，更可靠。
-     *
-     * <p>只比 /24：相机热点与家路由器都是标准 /24，本项目不做跨网段连接。
-     */
+    /** 按 LinkAddress 的实际 IPv4 前缀匹配直连子网，不把默认路由视为匹配。 */
     private fun sameSubnet(network: Network, cm: android.net.ConnectivityManager, host: String): Boolean {
-        val localIp = runCatching {
-            cm.getLinkProperties(network)?.linkAddresses
-                ?.firstOrNull { it.address is java.net.Inet4Address }
-                ?.address?.hostAddress
-        }.getOrNull() ?: return false
-        val a = localIp.split(".")
-        val b = host.split(".")
-        if (a.size != 4 || b.size != 4) return false
-        return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+        val parts = host.split('.').map { it.toIntOrNull() ?: return false }
+        if (parts.size != 4 || parts.any { it !in 0..255 }) return false
+        val target = parts.fold(0L) { value, octet -> (value shl 8) or octet.toLong() }
+        return runCatching {
+            cm.getLinkProperties(network)?.linkAddresses.orEmpty().any { link ->
+                val address = link.address as? java.net.Inet4Address ?: return@any false
+                val prefix = link.prefixLength
+                if (prefix !in 1..32) return@any false
+                val local = address.address.fold(0L) { value, byte ->
+                    (value shl 8) or (byte.toInt() and 0xff).toLong()
+                }
+                val mask = (0xffffffffL shl (32 - prefix)) and 0xffffffffL
+                (local and mask) == (target and mask)
+            }
+        }.getOrDefault(false)
     }
 
     /** 断开时解除进程级绑定，恢复系统默认选网 */
@@ -419,6 +407,11 @@ object ConnectionCenter {
      * 现在**进软件自动连上次那台**，不再需要让用户从列表里挑一台来连。
      */
     fun startPairingScan(context: Context, force: Boolean = false) {
+        if (force) {
+            recoveryJob?.cancel()
+            recoveryJob = null
+            autoReconnecting = false
+        }
         // ★★ 手动扫描**终止正在跑的"自动连上次那台"**（用户两次点名）：
         //   进软件自动连不上时的三轮扫描（第三轮补扫整个 /24 要 9 秒多）把
         //   `connecting` 顶住，配对页点"扫描可配对相机"静默 return —— 用户要
@@ -438,38 +431,42 @@ object ConnectionCenter {
             autoScanJob?.cancel()
         }
         autoScanJob = scope.launch {
-            val deadline = System.currentTimeMillis() + AUTO_SCAN_TIMEOUT_MS
-            scanning = true
-            scanResults = emptyList()
-            lastError = null
-            while (!connecting && System.currentTimeMillis() < deadline) {
-                val found = try {
-                    // 扫描阶段还不知道目标是哪台 → 用配对表里的相机 IP + 网关做同网段判断
-                    pinWifiNetwork(context, probeHosts = knownCameraHosts())
-                    // force=手动重扫：要列全（不早退），否则第二台待配对的相机永远看不见
-                    Discovery.scan(context, boundNetwork, knownCameraHosts(), thorough = force)
-                        .filter { it.pairingMode }
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.d(TAG, "scan failed: ${e.message}")
-                    null
+            try {
+                withTimeoutOrNull(AUTO_SCAN_TIMEOUT_MS) {
+                    val deadline = System.currentTimeMillis() + AUTO_SCAN_TIMEOUT_MS
+                    scanning = true
+                    scanResults = emptyList()
+                    lastError = null
+                    while (!connecting && System.currentTimeMillis() < deadline) {
+                        val found = try {
+                            // 扫描阶段还不知道目标是哪台 → 用配对表里的相机 IP + 网关做同网段判断
+                            pinWifiNetwork(context, probeHosts = knownCameraHosts())
+                            // force=手动重扫：要列全（不早退），否则第二台待配对的相机永远看不见
+                            Discovery.scan(context, boundNetwork, knownCameraHosts(), thorough = force)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.d(TAG, "scan failed: ${e.message}")
+                            null
+                        }
+                        if (connecting) break
+                        // ★ 新扫描请求已把本任务取消时，老任务**到此为止**：
+                        //   不许把扫到的旧结果盖到新一轮头上（用户实测：扫描中再点扫描没反应，
+                        //   现在点 = 终止老的重新扫，这里保证两轮不打架）
+                        ensureActive()
+                        scanResults = found ?: emptyList()
+                        // 扫到可配对相机就停下展示列表：配哪个由用户自己挑
+                        if (!found.isNullOrEmpty()) break
+                        val remain = deadline - System.currentTimeMillis()
+                        if (remain > 0) delay(minOf(3000L, remain))
+                    }
                 }
-                if (connecting) break
-                // ★ 新扫描请求已把本任务取消时，老任务**到此为止**：
-                //   不许把扫到的旧结果盖到新一轮头上（用户实测：扫描中再点扫描没反应，
-                //   现在点 = 终止老的重新扫，这里保证两轮不打架）
-                ensureActive()
-                scanResults = found ?: emptyList()
-                // 扫到可配对相机就停下展示列表：配哪个由用户自己挑
-                if (!found.isNullOrEmpty()) break
-                val remain = deadline - System.currentTimeMillis()
-                if (remain > 0) delay(minOf(3000L, remain))
-            }
-            scanning = false
-            // 超时且一无所获：报告原因，不再自动扫描
-            if (!connecting && scanResults.isEmpty()) {
-                lastError = "未发现处于配对模式的相机"
+                // 超时且一无所获：报告原因，不再自动扫描
+                if (!connecting && scanResults.isEmpty()) {
+                    lastError = "未发现相机"
+                }
+            } finally {
+                if (autoScanJob == coroutineContext[Job]) scanning = false
             }
         }
     }
@@ -547,18 +544,20 @@ object ConnectionCenter {
      */
     private suspend fun scanFor(
         context: Context,
-        guidHex: String,
+        guidHex: String?,
         thorough: Boolean,
         sweep: Boolean = true,
     ): Discovery.DiscoveredCamera? =
         try {
-            val knownIp = PairingStore.find(guidHex)?.lastIp?.takeIf { it.isNotBlank() }
+            val knownIp = guidHex?.let { PairingStore.find(it) }?.lastIp?.takeIf { it.isNotBlank() }
             // 目标是这台相机 → 按它的地址选网络（多 Wi-Fi 环境下才不会绑错）
             pinWifiNetwork(context, targetHost = knownIp)
             // 目标那台记录过的地址排在最前：绝大多数情况第一轮就命中
             val prefer = listOfNotNull(knownIp)
-            Discovery.scan(context, boundNetwork, prefer, thorough = thorough, sweep = sweep)
-                .firstOrNull { it.guidHex == guidHex }
+            Discovery.scan(context, boundNetwork, prefer, thorough = thorough, sweep = sweep, targetGuid = guidHex)
+                .firstOrNull { guidHex == null || it.guidHex == guidHex }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.d(TAG, "scanFor failed guid=$guidHex: ${e.message}")
             null
@@ -569,9 +568,9 @@ object ConnectionCenter {
      *
      * 三轮：**前两轮只打已知地址**（各 0.3 秒，相机开机后联网通常几秒内就能命中），
      * 第三轮才补扫整个子网（那一轮要 9 秒多）。这样"相机就在原地"的常规情况一秒内连上，
-     * 只有地址真的变了才付那 9 秒；三轮都没命中才报"未找到"，界面留在主界面给"重新连接"。
+     * 只有地址真的变了才付那 9 秒；三轮都没命中后，自动重连任务等待 5 秒再试。
      */
-    fun autoConnectLast(context: Context) = startConnect(context, lastTargetGuid())
+    fun autoConnectLast(context: Context) = reconnect(context)
 
     /**
      * 重连（主界面"重新连接"按钮、切换设备失败后再试）。
@@ -579,7 +578,29 @@ object ConnectionCenter {
      * 先用 [targetGuid]：用户刚在悬浮窗里点了哪台，就该重试哪台 —— 只有没有目标时
      * 才退回配对表里最近联系过的那台。
      */
-    fun reconnect(context: Context) = startConnect(context, targetGuid ?: lastTargetGuid())
+    fun reconnect(context: Context) {
+        startConnect(context, targetGuid ?: lastTargetGuid())
+        scheduleRecovery(context)
+    }
+
+    private fun scheduleRecovery(context: Context) {
+        if (recoveryJob?.isActive == true) return
+        autoReconnecting = true
+        recoveryJob = scope.launch {
+            try {
+                pollReconnect(
+                    intervalMs = 1_000,
+                    connected = { state == State.CONNECTED },
+                    keepTrying = { true },
+                    canAttempt = { !connecting && !scanning && !awaitingReconnect &&
+                        pairingStage == PairStage.IDLE && autoConnectJob?.isActive != true },
+                    attempt = { startConnect(context.applicationContext, targetGuid ?: lastTargetGuid()) },
+                )
+            } finally {
+                if (recoveryJob == coroutineContext[Job]) autoReconnecting = false
+            }
+        }
+    }
 
     /**
      * 边拍边传期间的**静默重连尝试**（一轮；仅 `LiveTransferCenter` 的有界重连循环调用）。
@@ -596,47 +617,61 @@ object ConnectionCenter {
         if (autoConnectJob?.isActive == true) return   // 已有一轮在跑，别叠加抢 UDP 套接字
         val guid = targetGuid ?: lastTargetGuid() ?: return
         autoConnectJob = scope.launch {
-            connecting = true
-            val target = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                scanFor(context, guid, thorough = false, sweep = sweep)
+            try {
+                connecting = true
+                connectionProgress = if (sweep) "后台重连：搜索相机新地址…" else "后台重连：搜索已保存地址…"
+                val target = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    scanFor(context, guid, thorough = false, sweep = sweep)
+                }
+                connecting = false
+                if (targetGuid != guid) return@launch   // 用户改主意了：这次作废
+                if (target != null) connectTo(context, target)
+            } finally {
+                if (autoConnectJob == coroutineContext[Job]) {
+                    connecting = false
+                    connectionProgress = ""
+                }
             }
-            connecting = false
-            if (targetGuid != guid) return@launch   // 用户改主意了：这次作废
-            if (target != null) connectTo(context, target)
         }
     }
 
     private fun startConnect(context: Context, guid: String?) {
         if (state != State.DISCONNECTED || connecting) return
-        if (guid.isNullOrBlank()) return
         // 已经有一轮在跑就别叠加：叠加会让多轮扫描互相抢 UDP 套接字，反而更慢
         if (autoConnectJob?.isActive == true) return
         targetGuid = guid
         lastError = null
         selectQueue(guid)   // 队列跟着选中走（进软件自动连的那台就是它的队列）
         autoConnectJob = scope.launch {
-            connecting = true
-            var target: Discovery.DiscoveredCamera? = null
-            for (round in 0 until AUTO_CONNECT_ROUNDS) {
-                target = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    // 最后一轮才补扫全子网（9 秒级）；前几轮只打已知地址（0.3 秒级）
-                    scanFor(context, guid, thorough = false, sweep = round == AUTO_CONNECT_ROUNDS - 1)
+            try {
+                connecting = true
+                var target: Discovery.DiscoveredCamera? = null
+                for (round in 0 until AUTO_CONNECT_ROUNDS) {
+                    connectionProgress = if (round == AUTO_CONNECT_ROUNDS - 1)
+                        "搜索相机新地址…" else "搜索已保存地址（${round + 1}/$AUTO_CONNECT_ROUNDS）…"
+                    target = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        // 最后一轮才补扫全子网（9 秒级）；前几轮只打已知地址（0.3 秒级）
+                        scanFor(context, guid, thorough = false, sweep = guid == null || round == AUTO_CONNECT_ROUNDS - 1)
+                    }
+                    if (target != null) break
+                    // 用户在这几秒里点了别的设备：放弃这次，别再报"没找到上一台"
+                    if (targetGuid != guid) {
+                        connecting = false
+                        return@launch
+                    }
+                    delay(AUTO_CONNECT_RETRY_MS)
                 }
-                if (target != null) break
-                // 用户在这几秒里点了别的设备：放弃这次，别再报"没找到上一台"
-                if (targetGuid != guid) {
-                    connecting = false
+                connecting = false
+                if (targetGuid != guid) return@launch
+                if (target == null) {
+                    lastError = "未找到 ${labelOf(guid)}，请确认相机端 AlphaSync 服务正常运行并与本机在同一网络"
                     return@launch
                 }
-                delay(AUTO_CONNECT_RETRY_MS)
+                connectTo(context, target)
+            } finally {
+                connecting = false
+                connectionProgress = ""
             }
-            connecting = false
-            if (targetGuid != guid) return@launch
-            if (target == null) {
-                lastError = "未找到 ${labelOf(guid)}，请确认相机端 AlphaSync 服务正常运行并与本机在同一网络"
-                return@launch
-            }
-            connectTo(context, target)
         }
     }
 
@@ -710,143 +745,156 @@ object ConnectionCenter {
         lastError = null   // 入口先清：否则上次的"配对码不正确"会一直挂在界面上
         targetGuid = cam.guidHex   // 主界面"正在连接 xxx"要立刻有东西可显示
         scope.launch {
-            connecting = true
-            val ok = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                try {
-                    // 先钉住 Wi-Fi 网络（双开蜂窝时防甩网），再走 PTP/IP。
-                    // 目标地址交给它选网：手机同时开着多个 Wi-Fi 时必须绑对那条。
-                    pinWifiNetwork(context, targetHost = cam.host)
-                    ObjectRepository.boundNetwork = boundNetwork
+            try {
+                connecting = true
+                connectionProgress = "连接 ${cam.host}:${cam.protoPort}…"
+                val ok = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    try {
+                        // 先钉住 Wi-Fi 网络（双开蜂窝时防甩网），再走 PTP/IP。
+                        // 目标地址交给它选网：手机同时开着多个 Wi-Fi 时必须绑对那条。
+                        pinWifiNetwork(context, targetHost = cam.host)
+                        ObjectRepository.boundNetwork = boundNetwork
 
-                    // 强制配对：配对表是唯一准入依据（相机端也这么判），未配对就引导去配对
-                    if (!PairingStore.contains(cam.guidHex)) {
-                        Log.d(TAG, "未配对，需要先配对：${cam.guidHex}")
-                        lastError = "该相机尚未配对，请先配对"
-                        return@withContext false
-                    }
+                        when (ObjectRepository.connect(
+                            host = cam.host,
+                            protoPort = cam.protoPort,
+                            // ★★★ **本机自己的 guid16**，不是相机的（曾经错填 cam.cameraGuid16）：
+                            //   PTP/IP 的 `Init Command Request` 里那个 GUID 是**发起方（手机）的身份**，
+                            //   相机端 `serveControl` 拿它当"这台手机是谁"——查配对表、建会话、签发
+                            //   传输令牌全用它。填成相机码的后果（实测）：所有手机在相机眼里都是同一个
+                            //   身份（= 相机自己的设备码）→ 相机配对表里永远只有一条记录、名字随最后
+                            //   连接者变；某台手机配对成功后，**其它手机**再来配对会被当成"已配对"而
+                            //   拒绝握手（回 NOT_SUPPORTED，手机端报"相机端版本过旧"）。
+                            guid16 = IdentityRepo.guid16(),
+                            friendlyName = IdentityRepo.friendlyName,
+                            onEvent = eventListener,
+                        )) {
+                            ObjectRepository.ConnectOutcome.OK -> Unit
 
-                    when (ObjectRepository.connect(
-                        host = cam.host,
-                        protoPort = cam.protoPort,
-                        // ★★★ **本机自己的 guid16**，不是相机的（曾经错填 cam.cameraGuid16）：
-                        //   PTP/IP 的 `Init Command Request` 里那个 GUID 是**发起方（手机）的身份**，
-                        //   相机端 `serveControl` 拿它当"这台手机是谁"——查配对表、建会话、签发
-                        //   传输令牌全用它。填成相机码的后果（实测）：所有手机在相机眼里都是同一个
-                        //   身份（= 相机自己的设备码）→ 相机配对表里永远只有一条记录、名字随最后
-                        //   连接者变；某台手机配对成功后，**其它手机**再来配对会被当成"已配对"而
-                        //   拒绝握手（回 NOT_SUPPORTED，手机端报"相机端版本过旧"）。
-                        guid16 = IdentityRepo.guid16(),
-                        friendlyName = IdentityRepo.friendlyName,
-                        onEvent = eventListener,
-                    )) {
-                        ObjectRepository.ConnectOutcome.OK -> Unit
+                            ObjectRepository.ConnectOutcome.NOT_PAIRED -> {
+                                recoveryJob?.cancel()
+                                // 保留本地记录和失败原因；不能把一次启动后的拒绝当成主动解除配对。
+                                // 自动删表会让界面跳到配对扫描并清空错误，掩盖实际失败原因。
+                                Log.d(TAG, "相机未认可本机配对，保留本地记录：${cam.guidHex}")
+                                lastError = "相机端仍要求配对，请安装配套的免配对直连版相机 APK"
+                                return@withContext false
+                            }
 
-                        ObjectRepository.ConnectOutcome.NOT_PAIRED -> {
-                            // 相机侧已解除本机配对（本机记录是旧的）：**必须清掉本地记录**，
-                            // 否则 UI 会因为"本地认为已配对"而永远只给"连接"按钮，用户怎么点
-                            // 都连不上。清掉后界面自然回到"配对"入口。
-                            Log.d(TAG, "相机已解除本机配对，清本地记录：${cam.guidHex}")
-                            PairingStore.remove(cam.guidHex)
-                            lastError = "相机已解除与本机的配对，请重新配对"
-                            return@withContext false
+                            ObjectRepository.ConnectOutcome.BUSY -> {
+                                lastError = "相机正被其他设备占用（配对中或已连接），请稍后重试"
+                                return@withContext false
+                            }
+
+                            ObjectRepository.ConnectOutcome.FAILED -> {
+                                lastError = "连接 ${cam.host}:${cam.protoPort} 失败：${ObjectRepository.lastConnectError ?: "未收到有效应答"}"
+                                Log.d(TAG, "connect failed host=${cam.host}:${cam.protoPort}")
+                                return@withContext false
+                            }
                         }
-
-                        ObjectRepository.ConnectOutcome.BUSY -> {
-                            lastError = "相机正被其他设备占用（配对中或已连接），请稍后重试"
-                            return@withContext false
+                        // Direct-connect: the local table remembers addresses and camera metadata only.
+                        if (!PairingStore.contains(cam.guidHex)) {
+                            PairingStore.upsert(PairingStore.PairedCamera(
+                                peerDeviceId = cam.guidHex,
+                                peerName = cam.name,
+                                pairedAt = System.currentTimeMillis(),
+                                lastSeenAt = System.currentTimeMillis(),
+                                lastIp = cam.host,
+                                lastPort = cam.protoPort,
+                            ))
                         }
+                        // 先落占位信息，让 UI 立刻有相机名；随后被全量信息覆盖
+                        DeviceStore.apply(
+                            CameraInfo.placeholder(cam.guidHex, cam.name, cam.protoPort, cam.filePort)
+                        )
 
-                        ObjectRepository.ConnectOutcome.FAILED -> {
-                            Log.d(TAG, "connect failed host=${cam.host}:${cam.protoPort}")
-                            return@withContext false
-                        }
-                    }
-                    // 先落占位信息，让 UI 立刻有相机名；随后被全量信息覆盖
-                    DeviceStore.apply(
-                        CameraInfo.placeholder(cam.guidHex, cam.name, cam.protoPort, cam.filePort)
-                    )
-
-                    // 全量设备信息：**整个会话只拉这一次**（型号/序列号/固件/模式/SSID
-                    // 都不会变）。失败不致命，重连即可。
-                    val info = pullDeviceInfo(cam)
-                    if (info != null) {
-                        DeviceStore.apply(info)
-                        // ★ 回填配对表：老记录的型号/序列号可能是空的（配对那一刻
-                        //   DEVICE_INFO 没拉到，此后常规重连只 touch 不补全）——
-                        //   显示层虽然能推导，但正式值趁连接成功补进去才算治本。
-                        PairingStore.find(cam.guidHex)?.let { p ->
-                            val fillModel = p.peerModel.isBlank() && info.model.isNotBlank()
-                            val fillSerial = p.peerSerial.isBlank() && info.serial.isNotBlank()
-                            if (fillModel || fillSerial) {
-                                PairingStore.upsert(
-                                    p.copy(
-                                        peerModel = if (fillModel) info.model else p.peerModel,
-                                        peerSerial = if (fillSerial) info.serial else p.peerSerial,
+                        // 全量设备信息：**整个会话只拉这一次**（型号/序列号/固件/模式/SSID
+                        // 都不会变）。失败不致命，重连即可。
+                        val info = pullDeviceInfo(cam)
+                        if (info != null) {
+                            DeviceStore.apply(info)
+                            // ★ 回填配对表：老记录的型号/序列号可能是空的（配对那一刻
+                            //   DEVICE_INFO 没拉到，此后常规重连只 touch 不补全）——
+                            //   显示层虽然能推导，但正式值趁连接成功补进去才算治本。
+                            PairingStore.find(cam.guidHex)?.let { p ->
+                                val fillModel = p.peerModel.isBlank() && info.model.isNotBlank()
+                                val fillSerial = p.peerSerial.isBlank() && info.serial.isNotBlank()
+                                if (fillModel || fillSerial) {
+                                    PairingStore.upsert(
+                                        p.copy(
+                                            peerModel = if (fillModel) info.model else p.peerModel,
+                                            peerSerial = if (fillSerial) info.serial else p.peerSerial,
+                                        )
                                     )
-                                )
+                                }
                             }
                         }
-                    }
 
-                    // ★★ 实时信息（电量/镜头）**必须放在最后**：它是 OP_PING 的产物，而
-                    //   上面那份 DEVICE_INFO 快照里没有这两个字段 —— 顺序反了就会被清成未知，
-                    //   界面上表现为"连上了还得等 3 秒心跳才出电量"（用户实测反馈）。
-                    //   这就是"连接完成时立刻同步一次实时数据"那句话的落点。
-                    applyLivePing(cam.host)
+                        // ★★ 实时信息（电量/镜头）**必须放在最后**：它是 OP_PING 的产物，而
+                        //   上面那份 DEVICE_INFO 快照里没有这两个字段 —— 顺序反了就会被清成未知，
+                        //   界面上表现为"连上了还得等 3 秒心跳才出电量"（用户实测反馈）。
+                        //   这就是"连接完成时立刻同步一次实时数据"那句话的落点。
+                        applyLivePing(cam.host)
 
-                    // 切到这台设备的传输队列（每台一套，见 TransferStore 的隔离说明），
-                    // 顺带把"最近可见"与协议代次写进配对表（相机侧也会同步）
-                    TransferStore.onCameraChanged(cam.guidHex)
-                    ObjectRepository.setOnDisconnectedListener(cam.host) {
-                        if (!::scope.isInitialized) return@setOnDisconnectedListener
-                        scope.launch {
-                            if (host == cam.host && state == State.CONNECTED) {
-                                // ★ 用户定版：**没收到任何声明**的断开 = 意外断连，
-                                //   统一按"失去与相机的连接"处理；有声明的那些走各自
-                                //   的事件处理（它们已经在事件回调里置位并给出说法）。
-                                disconnect(if (cameraDeclaredDisconnect) null else "失去与相机的连接")
+                        // 切到这台设备的传输队列（每台一套，见 TransferStore 的隔离说明），
+                        // 顺带把"最近可见"与协议代次写进配对表（相机侧也会同步）
+                        TransferStore.onCameraChanged(cam.guidHex)
+                        ObjectRepository.setOnDisconnectedListener(cam.host) {
+                            if (!::scope.isInitialized) return@setOnDisconnectedListener
+                            scope.launch {
+                                if (host == cam.host && state == State.CONNECTED) {
+                                    // ★ 用户定版：**没收到任何声明**的断开 = 意外断连，
+                                    //   统一按"失去与相机的连接"处理；有声明的那些走各自
+                                    //   的事件处理（它们已经在事件回调里置位并给出说法）。
+                                    disconnect(if (cameraDeclaredDisconnect) null else "失去与相机的连接", retry = true)
+                                }
                             }
                         }
-                    }
 
-                    // 刷新配对表"最近可见"与协议代次（相机侧也会同步）
-                    PairingStore.touch(cam.guidHex, cam.host, cam.protoPort)
-                    ObjectRepository.sessionOf(cam.host)?.let { s ->
-                        PairingStore.updateProtoVersion(cam.guidHex, s.client.protoVersion)
+                        // 刷新配对表"最近可见"与协议代次（相机侧也会同步）
+                        PairingStore.touch(cam.guidHex, cam.host, cam.protoPort)
+                        ObjectRepository.sessionOf(cam.host)?.let { s ->
+                            PairingStore.updateProtoVersion(cam.guidHex, s.client.protoVersion)
+                        }
+                        true
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        lastError = "连接异常：${e.javaClass.simpleName} ${e.message.orEmpty()}"
+                        Log.d(TAG, "connectTo exception: ${e.javaClass.simpleName} ${e.message}")
+                        rollback()
+                        false
                     }
-                    true
-                } catch (e: Exception) {
-                    Log.d(TAG, "connectTo exception: ${e.javaClass.simpleName} ${e.message}")
-                    rollback()
-                    false
                 }
-            }
-            connecting = false
-            if (ok) {
-                camera = cam
-                // ★ 这里**不重写** targetGuid："当前选中哪台"是用户的意图，不是连接结果 ——
-                //   握手这几秒里他可能已经点了别的设备（见下面的接力）。
-                host = cam.host
-                state = State.CONNECTED
-                // 记下"上次连的就是它"：下次进软件直接自动连这台（多设备适配）
-                appContext?.let { SettingsRepo.updateLastDevice(cam.guidHex) }
-                // 前台保活：切后台不被 MIUI 冻结/限网，心跳不因后台而断
-                appContext?.let { runCatching { ConnectionService.start(it) } }
-                startHeartbeat()
-                startThumbBatch()
-                // 2.7：边拍边传——连接（重新）建立后，若开关开着而巡检停着就恢复监控
-                LiveTransferCenter.onConnectionEstablished()
-            } else {
-                rollback()
-                if (lastError == null) lastError = "连接失败"
-            }
-            // 接力：握手期间用户又选了别的设备（选中指示当场就移过去了），这次的结果
-            // 不改变选中，但要接着把他选的那台切过来 —— 否则界面停在这台，而选中指示
-            // 指着另一台，用户点完发现"没反应"。
-            val wanted = targetGuid
-            if (wanted != null && !wanted.equals(cam.guidHex, ignoreCase = true)) {
-                Log.d(TAG, "握手期间目标改为 $wanted，接力切换")
-                switchTo(context, wanted)
+                connecting = false
+                if (ok) {
+                    camera = cam
+                    // ★ 这里**不重写** targetGuid："当前选中哪台"是用户的意图，不是连接结果 ——
+                    //   握手这几秒里他可能已经点了别的设备（见下面的接力）。
+                    host = cam.host
+                    state = State.CONNECTED
+                    // 记下"上次连的就是它"：下次进软件直接自动连这台（多设备适配）
+                    appContext?.let { SettingsRepo.updateLastDevice(cam.guidHex) }
+                    // 前台保活：切后台不被 MIUI 冻结/限网，心跳不因后台而断
+                    appContext?.let { runCatching { ConnectionService.start(it) } }
+                    startHeartbeat()
+                    startThumbBatch()
+                    // 2.7：边拍边传——连接（重新）建立后，若开关开着而巡检停着就恢复监控
+                    LiveTransferCenter.onConnectionEstablished(appContext)
+                } else {
+                    rollback()
+                    if (lastError == null) lastError = "连接失败"
+                }
+                // 接力：握手期间用户又选了别的设备（选中指示当场就移过去了），这次的结果
+                // 不改变选中，但要接着把他选的那台切过来 —— 否则界面停在这台，而选中指示
+                // 指着另一台，用户点完发现"没反应"。
+                val wanted = targetGuid
+                if (wanted != null && !wanted.equals(cam.guidHex, ignoreCase = true)) {
+                    Log.d(TAG, "握手期间目标改为 $wanted，接力切换")
+                    switchTo(context, wanted)
+                }
+            } finally {
+                connecting = false
+                connectionProgress = ""
             }
         }
     }
@@ -874,7 +922,7 @@ object ConnectionCenter {
             Log.d(TAG, "连上后首拉实时信息失败，等下一个心跳补")
             return
         }
-        DeviceStore.applyPing(p.batteryPct, p.lens, p.sdTotal, p.sdUsed)
+        DeviceStore.applyPing(p.batteryPct, p.lens, p.sdTotal, p.sdUsed, p.resources)
         Log.d(TAG, "连上后首拉实时信息：电量 ${p.batteryPct}%，镜头 ${p.lens}，SD ${p.sdUsed}/${p.sdTotal}")
     }
 
@@ -920,6 +968,9 @@ object ConnectionCenter {
                 //   热在用户**看不到**的那一端，而手机端最先要的那批每张都要相机现解析
                 //   （~24ms/张 + SD 读）——"相机端预取零解析"这个提速手段基本白费。
                 //   统一后：两端消费同一顺序，预取的热点 = 用户正在看的那一端。
+                val preferredDirectory = SettingsRepo.lastDirectory(camera?.guidHex.orEmpty())
+                val latestDirectory = io.github.bi2qfa.alphasync.data.PhotoWarmupOrder.latestDirectory(
+                    entries.map { io.github.bi2qfa.alphasync.data.PhotoWarmupOrder.Photo(it.path, it.timestamp) })
                 val keys = entries.map {
                     ThumbStore.ObjectCacheKey(
                         path = it.path,
@@ -927,7 +978,14 @@ object ConnectionCenter {
                         mtime = it.timestamp,
                     )
                 }.sortedWith(
-                    compareByDescending<ThumbStore.ObjectCacheKey> { it.mtime }
+                    compareBy<ThumbStore.ObjectCacheKey> {
+                        when (it.path.substringBeforeLast('/') ) {
+                            latestDirectory -> 0
+                            preferredDirectory -> 1
+                            else -> 2
+                        }
+                    }.thenByDescending { it.mtime }
+
                         .thenByDescending { it.path },
                 )
                 // ★ 诊断（10-01）：缓存指纹跨设备对账用 —— 缓存键 = path+size+mtime，
@@ -1022,6 +1080,27 @@ object ConnectionCenter {
     // ===== 心跳 =====
 
     private fun startHeartbeat() {
+        linkWatchJob?.cancel()
+        val watchedHost = host
+        val watchedCamera = camera
+        val watchedNetwork = boundNetwork
+        if (watchedHost != null && watchedCamera != null) {
+            linkWatchJob = scope.launch {
+                watchConnection(
+                    probe = {
+                        withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            controlPortReachable(watchedHost, watchedCamera.protoPort, watchedNetwork?.socketFactory)
+                        }
+                    },
+                    responseAgeMs = { ObjectRepository.responseAgeMs(watchedHost) },
+                    onLost = {
+                        if (state == State.CONNECTED && host == watchedHost && camera == watchedCamera) {
+                            disconnect("失去与相机的连接", retry = true)
+                        }
+                    },
+                )
+            }
+        }
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             var misses = 0
@@ -1037,14 +1116,14 @@ object ConnectionCenter {
                         // ★ 2.7：相机**声明过**这次断开（进后台/换方式/退出…）就不说
                         //   "失去与相机的连接" —— 那句话对后台化是假话，而且会盖掉
                         //   "等待相机…"的预期体验（用户定版：主动断连必须声明，声明了照实处理）。
-                        disconnect(if (cameraDeclaredDisconnect) null else "失去与相机的连接")
+                        disconnect(if (cameraDeclaredDisconnect) null else "失去与相机的连接", retry = true)
                         return@launch
                     }
                     continue
                 }
                 misses = 0
                 // 唯一的实时包：电量、镜头名与 SD 容量一起增量合并（不再有第二个定时器）
-                DeviceStore.applyPing(ping.batteryPct, ping.lens, ping.sdTotal, ping.sdUsed)
+                DeviceStore.applyPing(ping.batteryPct, ping.lens, ping.sdTotal, ping.sdUsed, ping.resources)
             }
         }
     }
@@ -1225,7 +1304,7 @@ object ConnectionCenter {
                     // ★ 用户定版：**没收到任何声明**的断开 = 意外断连，
                     //   统一按"失去与相机的连接"处理；有声明的那些走各自
                     //   的事件处理（它们已经在事件回调里置位并给出说法）。
-                    disconnect(if (cameraDeclaredDisconnect) null else "失去与相机的连接")
+                    disconnect(if (cameraDeclaredDisconnect) null else "失去与相机的连接", retry = true)
                 }
             }
         }
@@ -1302,15 +1381,21 @@ object ConnectionCenter {
      * @param reason 直接上屏的说辞；**null = 不报错**（用户主动断开、或相机已经
      *   自己声明过了、那句话已经显示在界面上，这里不该再用第二句覆盖它）。
      */
-    fun disconnect(reason: String? = null) {
+    fun disconnect(reason: String? = null, retry: Boolean = false) {
+        recoveryJob?.cancel()
+        recoveryJob = null
+        autoReconnecting = false
         // 留痕：自动断开（心跳失联）原先一行日志都没有，事后只能靠猜
         Log.d(TAG, "disconnect: ${reason ?: "无（用户主动 / 已声明过）"}")
         cameraDeclaredDisconnect = false   // 本次断开的声明已消费，下次连接重新计
         host?.let { ObjectRepository.setOnDisconnectedListener(it, null) }
         heartbeatJob?.cancel()
         heartbeatJob = null
+        linkWatchJob?.cancel()
+        linkWatchJob = null
         autoScanJob?.cancel()
         autoScanJob = null
+        scanning = false
         autoConnectJob?.cancel()
         autoConnectJob = null
         connecting = false
@@ -1330,5 +1415,6 @@ object ConnectionCenter {
         camera = null
         state = State.DISCONNECTED
         if (reason != null) lastError = reason
+        if (retry) appContext?.let { scheduleRecovery(it) }
     }
 }

@@ -52,7 +52,7 @@ find src/main/java -name '*.java' > "$OUT/sources.txt"
 echo "build_out/gen/R.java" >> "$OUT/sources.txt"   # aapt 生成的 R（在 gen 根）
 "$JDK/javac.exe" -encoding UTF-8 -source 1.6 -target 1.6 -nowarn -Xlint:-options \
   -bootclasspath "$AJAR" \
-  -classpath "$AJAR;libs/stubs.jar" \
+  -classpath "$AJAR;libs/webcontrol-stubs.jar;libs/stubs.jar" \
   -d "$OUT/obj" @"$OUT/sources.txt"
 
 echo "[3/6] dx (min-sdk 10) ..."

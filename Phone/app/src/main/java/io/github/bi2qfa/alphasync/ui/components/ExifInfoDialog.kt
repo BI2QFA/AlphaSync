@@ -29,11 +29,21 @@ import androidx.compose.ui.unit.dp
  *       （EXIF 随大预览一并传输/缓存）。</li>
  * </ul>
  *
- * <p>行序（用户定版）：文件名 / 文件格式 / 拍摄日期时间 / 相机型号 / 镜头型号 /
+ * <p>行序：文件名 / 文件格式 / 文件大小 / 拍摄日期时间 / 相机型号 / 镜头型号 /
  * 焦距 / 光圈 / 快门速度 / EV / ISO。本组件只负责画，不关心数据从哪来。
  */
 @Composable
-fun ExifInfoDialog(rows: List<Pair<String, String>>, onDismiss: () -> Unit) {
+fun ExifInfoDialog(rows: List<Pair<String, String>>, fileSize: Long?, onDismiss: () -> Unit) {
+    val fileSizeText = when {
+        fileSize == null || fileSize < 0 -> "未知"
+        fileSize >= 1024L * 1024 -> "%.2f MiB".format(fileSize / 1048576.0)
+        fileSize >= 1024L -> "%.2f KiB".format(fileSize / 1024.0)
+        else -> "$fileSize B"
+    }
+    val details = rows.toMutableList().apply {
+        val fileFields = rows.takeWhile { it.first == "文件名" || it.first == "文件格式" }
+        add(fileFields.size, "文件大小" to fileSizeText)
+    }
     PlainDialog(onDismissRequest = onDismiss) {
         Column(Modifier.padding(start = 24.dp, end = 24.dp, top = 24.dp)) {
             Text("照片信息", style = MaterialTheme.typography.headlineSmall)
@@ -44,7 +54,7 @@ fun ExifInfoDialog(rows: List<Pair<String, String>>, onDismiss: () -> Unit) {
                     .heightIn(max = 420.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                rows.forEach { (label, value) ->
+                details.forEach { (label, value) ->
                     Row {
                         Text(
                             label,

@@ -8,6 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import io.github.bi2qfa.alphasync.core.ConnectionCenter
 import io.github.bi2qfa.alphasync.data.ThumbStore
+import io.github.bi2qfa.alphasync.data.SettingsRepo
 import io.github.bi2qfa.alphasync.ptpip.ObjectRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -17,6 +18,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.CancellationException
 
 /**
  * 边拍边传（2.7 / 2.8）核心：连着相机时持续巡检"卡上有没有新照片"，
@@ -30,7 +34,7 @@ import kotlinx.coroutines.withContext
  * **文件**（目录一律 NOT_FOUND），旧代码把探测失败静默跳过了。
  *
  * 2.8 起改用 [ObjectRepository.dirCount] **计数探针**（零协议改动、任何相机端
- * 版本可用，见其注释）：每 [POLL_INTERVAL_MS] 一轮：
+ * 版本可用，见其注释）：按 [AutoSyncPolicy] 的自适应间隔巡检：
  * ```
  * 1. listPage("/DCIM", 0)  → 子目录清单；新子目录 = 有新内容（滚目录）
  * 2. 每个子目录 dirCount   → 条目数比上次多 = 有新照片；少了 = 删除/换卡
@@ -49,7 +53,7 @@ import kotlinx.coroutines.withContext
  * 全拉下来（换卡后同名目录、计数恰好变多、锚点必变 → 对账后旧面孔全失踪）。
  *
  * <h3>生命周期（与 2.7 相同）</h3>
- * - 开关（[enabled]）是**内存态**、不落盘（换卡/换相机的安全窗口比方便重要）。
+ * - 自动同步开关持久保存；连接后先完整建立基准，再恢复新照片下载。
  * - 相机后台化声明（[onCameraBackgroundDeclared]）后的断开 → 保持开关、起
  *   **有界自动重连**（热点模式 AP 要拆要重建，断链是预期行为）；
  *   其余断开（用户手动 / 相机退出 / 意外失联）→ 开关弹回关闭，绝不自动重连。
@@ -69,13 +73,13 @@ object LiveTransferCenter {
     private const val TAG = "LiveTransfer"
 
     /** 巡检周期：4 秒一轮（对拍照节奏足够灵敏；几条小包对控制面几乎零占用）。 */
-    private const val POLL_INTERVAL_MS = 4_000L
+    // Timing is selected by AutoSyncPolicy: discovery 2s/4s, pending confirmation 1s.
 
     /** 目录与目录之间的让出间隔（与 ConnectionCenter 全树扫描的 F6 纪律同款）。 */
     private const val SCAN_DIR_GAP_MS = 50L
 
     /** 待确认新照片最多等几轮（每轮 stat 一次 size；超龄丢弃——相机端删了或写卡异常）。 */
-    private const val PENDING_MAX_ROUNDS = 3
+    private const val PENDING_MISSING_TIMEOUT_MS = 12_000L
 
     /** 换卡判定：全量对账时已知图片失踪数下限（少于这个按"用户删了几张"处理）。 */
     private const val CARD_SWAP_MIN_MISSING = 4
@@ -134,6 +138,7 @@ object LiveTransferCenter {
      * 与 [active] 的区别：巡检随**连接**常开、不受 [enabled] 开关控制。
      */
     private var patrolling = false
+    private var syncGeneration = 0
 
     /** 监控的目标相机（会话建立时钉住；重连后必须还是它）。 */
     private var sessionGuid: String? = null
@@ -162,9 +167,9 @@ object LiveTransferCenter {
      *
      * 相机写卡是"先建目录条目、后写文件数据"——发现新条目那一刻 size 还在涨。
      * 每轮 stat 一遍名单：size 与上轮一致 = 写完了 → 入队；变了 → 更新再等；
-     * 连续 [PENDING_MAX_ROUNDS] 轮 stat 不到 → 丢弃（相机端删了/写卡异常）。
+     * 连续 12 秒 stat 不到 → 丢弃（相机端删了/写卡异常）。
      */
-    private class Pending(var size: Long, var mtime: Long, var rounds: Int)
+    private class Pending(var size: Long, var mtime: Long, var missingSince: Long = 0L)
 
     private val pendingNew = HashMap<String, Pending>()
 
@@ -206,58 +211,43 @@ object LiveTransferCenter {
     fun enable(context: Context) {
         if (enabled) return
         if (ConnectionCenter.state != ConnectionCenter.State.CONNECTED) return
-        val host = ConnectionCenter.host ?: return
         val guid = ConnectionCenter.camera?.guidHex ?: return
         appContext = context.applicationContext
-        if (scope == null) scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        SettingsRepo.updateAutoSyncEnabled(true)
+        syncGeneration++
         enabled = true
-        active = false
         expectReconnect = false
-        resuming = false
         autoCount = 0
         sessionGuid = guid
-        statusText = "正在启动同步…"
-        Log.d(TAG, "开启：基准扫描开始（$guid）")
-        scope?.launch {
-            val ok = buildBaseline(host)
-            if (!enabled) return@launch
-            if (!ok) {
-                statusText = "基准建立失败，请重试"
-                Log.w(TAG, "开启失败：基准扫描未完成")
-                return@launch
-            }
-            active = true
-            statusText = "监控中 · 已自动接收 $autoCount 张"
-            pollJob?.cancel()
-            pollJob = scope?.launch { pollLoop(host, guid) }
-        }
+        // Pending objects already discovered before the switch are not new downloads.
+        for ((path, pending) in pendingNew) knownFiles[path] = pending.size to pending.mtime
+        pendingNew.clear()
+        active = baselineReady
+        statusText = if (active) "监控中" else "正在完整建立照片基准…"
+        startPatrol()
     }
 
-    /** 关掉模式（用户关开关；或断连且非后台化 —— 由 [onConnectionLost] 调用）。 */
-    fun disable() {
-        // ★ 2.10（D4）：先收掉常驻巡检运行态（幂等；断连路径也会经过这里）
-        stopPatrol()
+    /** Only an explicit switch action changes the saved preference. */
+    fun disable(persistPreference: Boolean = true) {
+        syncGeneration++
+        if (persistPreference) SettingsRepo.updateAutoSyncEnabled(false)
         enabled = false
         active = false
         expectReconnect = false
         resuming = false
-        pollJob?.cancel()
-        pollJob = null
         reconnectJob?.cancel()
         reconnectJob = null
-        knownFiles.clear()
-        knownDirs.clear()
-        pendingNew.clear()
-        enqueuedIds.clear()   // ★ 2.10（F2）：入队幂等册与账本同步清空
-        panelEntries.clear()  // ★ 2.11 §9：同步页面板与开关同寿（关开关 = 重置记录）
-        pendingEnqueue.clear()  // ★ 2.11 第二轮（§5.1）：待发池与面板同寿
-        stableRounds = 0
-        sessionGuid = null
+        panelEntries.clear()
+        pendingEnqueue.clear()
+        enqueuedIds.clear()
+        autoCount = 0
         statusText = ""
-        scope?.cancel()
-        scope = null
-        appContext = null
-        Log.d(TAG, "已关闭")
+        // Keep the single detector and its baseline alive while connected.
+        if (ConnectionCenter.state != ConnectionCenter.State.CONNECTED) {
+            stopPatrol()
+            scope?.cancel()
+            scope = null
+        }
     }
 
     /**
@@ -305,7 +295,7 @@ object LiveTransferCenter {
         autoCount = 0
         if (!keepSwitch) {
             // 普通断开（用户手动 / 相机退出 / 换方式 / 意外失联）：断开即停、开关弹回关闭
-            if (enabled) disable()
+            if (enabled) disable(persistPreference = false)
             // ★ 第三批（§6）：**声明驱动**的重连不依赖开关 —— 收到过"后台声明"
             //   （expectReconnect 仍在 TTL 内）就起有界重连，兑现"等待重新连接"；
             //   无声明的普通断开维持手动重连（本分支直接返回）。
@@ -321,25 +311,17 @@ object LiveTransferCenter {
     }
 
     /** 连接建立（`ConnectionCenter.connectTo` 成功后调用）：开关开着就恢复巡检。 */
-    fun onConnectionEstablished() {
-        // ★ 2.10（D4）：巡检常开——连接（重新）建立即启动检测（不等开关）。
-        //   开关开着时**不走这里的巡检分支**：下方"enabled 恢复"（resumeMonitoring）
-        //   会重建基准并接管同一套轮询（它本身就是一次完整巡检），再 startPatrol
-        //   只会多付一次全树基线扫描；开关关着时由这里启动常驻巡检。
-        if (!enabled && !patrolling) startPatrol()
-        if (!enabled || active) return
-        val sc = scope ?: return
-        sc.launch { resumeMonitoring() }
+    fun onConnectionEstablished(context: Context? = null) {
+        context?.let { appContext = it.applicationContext }
+        enabled = SettingsRepo.autoSyncEnabled
+        active = enabled && baselineReady
+        if (enabled && !active) statusText = "正在完整建立照片基准…"
+        startPatrol()
     }
 
-    /**
-     * ★ 2.10（D4）巡检常开入口：连接期间持续检测"卡上有没有新照片"（不需要开任何开关），
-     * 确认稳定的照片永远注入缩略图预取（产物分流见 [confirmPending]）。
-     *
-     * 骨架参照 [enable]，但**不碰**开关相关状态（enabled/active/statusText/autoCount）：
-     * - 已在巡检 / 未连接 → 直接返回（幂等）；
-     * - 基线失败 → 静默放弃（Log.d 一行），下次连接/重连再建。
-     */
+    private var baselineReady = false
+
+    /** One coroutine owns both baseline construction and patrol for this connection. */
     fun startPatrol() {
         if (patrolling) return
         if (ConnectionCenter.state != ConnectionCenter.State.CONNECTED) return
@@ -348,17 +330,18 @@ object LiveTransferCenter {
         if (scope == null) scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         patrolling = true
         sessionGuid = guid
-        Log.d(TAG, "巡检常开：基准扫描开始（$guid）")
-        scope?.launch {
-            val ok = buildBaseline(host)
-            if (!patrolling) return@launch   // 期间断连/关闭：不再启动轮询
-            if (!ok) {
-                patrolling = false
-                Log.d(TAG, "巡检常开：基准建立失败，静默放弃（下次连接重建）")
-                return@launch
+        pollJob = scope?.launch {
+            while (patrolling && ConnectionCenter.state == ConnectionCenter.State.CONNECTED &&
+                ConnectionCenter.camera?.guidHex == guid) {
+                if (buildBaseline(host)) break
+                if (enabled) statusText = "照片基准未完整读取，正在重试…"
+                delay(2_000L)
             }
-            pollJob?.cancel()
-            pollJob = scope?.launch { pollLoop(host, guid) }
+            currentCoroutineContext().ensureActive()
+            if (!patrolling || !baselineReady) return@launch
+            active = enabled
+            if (enabled) statusText = "监控中"
+            pollLoop(host, guid)
         }
     }
 
@@ -368,6 +351,8 @@ object LiveTransferCenter {
      * （供"后台化重连必须还是同一台"的既有守卫使用）。
      */
     fun stopPatrol() {
+        syncGeneration++
+        baselineReady = false
         patrolling = false
         pollJob?.cancel()
         pollJob = null
@@ -383,8 +368,9 @@ object LiveTransferCenter {
     // ============================================================
 
     private suspend fun pollLoop(host: String, guid: String) {
+        var lastDiscoveryAt = 0L
         while (true) {
-            delay(POLL_INTERVAL_MS)
+            delay(AutoSyncPolicy.tickInterval(enabled && active, pendingNew.isNotEmpty()))
             // 断连 / 目标变了：由 onConnectionLost / onConnectionEstablished 接管
             if (ConnectionCenter.state != ConnectionCenter.State.CONNECTED ||
                 ConnectionCenter.camera?.guidHex != guid
@@ -396,6 +382,11 @@ object LiveTransferCenter {
             // ①' ★ 2.11 第二轮（§5.1）兜底：同步串行补位（幂等；覆盖终态回调丢失、
             //    进程内状态错位等边角 —— 池空或水位已占时是空操作）。
             if (enabled && active) topUpQueue(guid)
+
+            // Check pending writes quickly, but do not probe the entire card every second.
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (lastDiscoveryAt != 0L && now - lastDiscoveryAt < AutoSyncPolicy.discoveryInterval(enabled && active)) continue
+            lastDiscoveryAt = now
 
             // ② /DCIM 首页：子目录清单（不依赖 mtime）+ DCIM 层散落图片
             val page = listPageSafe(host, "/DCIM", 0, scan = false)
@@ -455,6 +446,8 @@ object LiveTransferCenter {
 
     /** 待确认名单结算：size 稳定的产出（注入预取 + 按开关入队，mtime 升序），还在写的继续等。 */
     private suspend fun confirmPending(host: String, guid: String) {
+        val generation = syncGeneration
+        val downloadEligible = enabled && active
         if (pendingNew.isEmpty()) return
         val ready = ArrayList<ObjectRepository.FtpEntry>()
         val dead = ArrayList<String>()
@@ -462,15 +455,19 @@ object LiveTransferCenter {
         //   遍历里直接 remove（HashMap 结构修改 → ConcurrentModificationException），
         //   照 dead 列表同款：先记账、循环后统一摘。
         val confirmed = ArrayList<String>()
-        for ((path, p) in pendingNew) {
+        // A switch action may clear pendingNew while stat suspends this coroutine.
+        for ((path, p) in pendingNew.toMap()) {
             val st = withContext(Dispatchers.IO) {
                 runCatching { ObjectRepository.stat(host, path) }.getOrNull()
             }
             if (st == null) {
                 // stat 不到（网络抖动 / 文件已删）：等满上限再丢，不急着判死
-                if (++p.rounds >= PENDING_MAX_ROUNDS) dead.add(path)
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (p.missingSince == 0L) p.missingSince = now
+                if (now - p.missingSince >= PENDING_MISSING_TIMEOUT_MS) dead.add(path)
                 continue
             }
+            p.missingSince = 0L
             if (st.size == p.size) {
                 // size 稳定 = 写卡完成 → 记入基准并进本轮产物名单
                 knownFiles[path] = st.size to st.mtime
@@ -480,11 +477,10 @@ object LiveTransferCenter {
                 // 还在写：更新 size 继续等
                 p.size = st.size
                 p.mtime = st.mtime
-                p.rounds = 0
             }
         }
         for (p in dead) {
-            Log.d(TAG, "待确认照片 $PENDING_MAX_ROUNDS 轮未读到，丢弃：$p")
+            Log.d(TAG, "待确认照片连续 12 秒未读到，丢弃：$p")
             pendingNew.remove(p)
         }
         // ★ 2.10 修复（F1）：成功确认的从待办摘除——此前只进 knownFiles/ready、从不摘除，
@@ -502,12 +498,15 @@ object LiveTransferCenter {
                 ThumbStore.ObjectCacheKey(path = it.path, size = it.size, mtime = it.timestamp)
             }.asReversed()
             ThumbStore.injectNew(injectOrder)
-            if (enabled && active) {
+            if (downloadEligible && generation == syncGeneration && enabled && active) {
                 // ★ 2.11 第二轮（§5.1）：产物**全进面板 + 待发池**（不再整批入队）；
                 //   入队交串行水位（[topUpQueue]）——"上一个传完，下一个才入队"。
                 //   面板 = 全部（显示），队列 = 逐张推进（传输），两者共用一份产物。
-                panelEntries.addAll(ready)
-                pendingEnqueue.addAll(ready)
+                val downloads = ready.filter {
+                    AutoSyncPolicy.accepts(it.path, SettingsRepo.autoSyncJpg, SettingsRepo.autoSyncRaw)
+                }
+                panelEntries.addAll(downloads)
+                pendingEnqueue.addAll(downloads)
                 topUpQueue(guid)
             }
         }
@@ -517,17 +516,16 @@ object LiveTransferCenter {
     private suspend fun growDir(host: String, path: String, watch: DirWatch, newCount: Int) {
         Log.d(TAG, "目录有新增：$path（${watch.count} → $newCount）")
         var offset = watch.count
-        var last = offset
+        val discovered = ArrayList<ObjectRepository.FtpEntry>()
         while (true) {
-            val p = listPageSafe(host, path, offset, scan = false) ?: break
-            for (e in p.entries) {
-                if (!e.isDir && isImage(e) && knownFiles[e.path] == null) {
-                    markPending(e)
-                }
-            }
-            if (!p.hasMore || p.nextOffset <= last) break
-            last = p.nextOffset
-            offset = p.nextOffset
+            val page = listPageSafe(host, path, offset, scan = false) ?: return
+            discovered.addAll(page.entries)
+            if (!page.hasMore) break
+            if (page.entries.isEmpty() || page.nextOffset <= offset) return
+            offset = page.nextOffset
+        }
+        for (entry in discovered) {
+            if (!entry.isDir && isImage(entry) && knownFiles[entry.path] == null) markPending(entry)
         }
         watch.count = newCount
     }
@@ -614,7 +612,7 @@ object LiveTransferCenter {
         TransferStore.enqueueBatch(q, items)
         for (it in items) enqueuedIds.add(identityKey(it.id, it.size, it.mtime))
         autoCount += items.size
-        statusText = "监控中 · 已自动接收 $autoCount 张"
+        statusText = "监控中 · 已自动加入 $autoCount 个文件"
         Log.d(TAG, "自动入队 ${items.size} 张（累计 $autoCount）：首张=${items.first().path}")
         val ctx = appContext
         if (ctx != null) {
@@ -655,9 +653,31 @@ object LiveTransferCenter {
             }
         }
         if (settled.isNotEmpty()) pendingEnqueue.removeAll(settled)
-        if (active) return   // 水位占着：等它落终态（回调/兜底会再来）
+        if (active) {
+            // A start during the previous worker's teardown may have been ignored.
+            // Patrol must restart queued work after that worker actually exits.
+            if (!DownloadService.isActive() && q.items.any { it.state == TransferState.QUEUED }) {
+                appContext?.let { ctx ->
+                    runCatching { DownloadService.start(ctx) }
+                        .onFailure { Log.w(TAG, "恢复自动下载失败", it) }
+                }
+            }
+            return
+        }
         val next = pendingEnqueue.firstOrNull() ?: return
         enqueueNew(listOf(next), guid)
+    }
+
+    /** Counts describe original downloads, including files still waiting in the sync pool. */
+    fun downloadStatusText(): String {
+        if (!active) return statusText
+        val guid = sessionGuid ?: return statusText
+        val q = TransferStore.queueFor(guid)
+        val progress = AutoSyncProgress.from(panelEntries.map {
+            TransferStore.stateOf(q, it.path, it.size, it.timestamp)
+        })
+        val paused = if (ThumbStore.downloadWaitingForPreview) " · 等待新照片预览" else ""
+        return "监控中 · 待下载 ${progress.waiting} · 下载中 ${progress.running} · 已完成 ${progress.done} · 失败 ${progress.failed}$paused"
     }
 
     // ============================================================
@@ -711,21 +731,21 @@ object LiveTransferCenter {
      * <p>流程（主线程）：摘出待发池 → 入队（幂等）→ 提头 + 收回 QUEUED（磁盘
      * `.part` 原样，断点天然保留）→ 打断旧批次、等其退出后从队头起跑。
      */
-    fun startNow(entries: List<ObjectRepository.FtpEntry>) {
+    fun startNow(entries: List<ObjectRepository.FtpEntry>, priority: Boolean = false) {
         if (entries.isEmpty()) return
         val ctx = appContext ?: return
         val guid = sessionGuid ?: ConnectionCenter.camera?.guidHex ?: return
         val q = TransferStore.queueFor(guid)
         val wanted = entries.map {
-            TransferItem(id = it.path, name = it.name, path = it.path, size = it.size, mtime = it.timestamp)
+            TransferItem(id = it.path, name = it.name, path = it.path, size = it.size, mtime = it.timestamp, priorityDownload = priority)
         }
         // 摘出待发池（身份精确匹配：同 path 重拍不算同一条）——避免它们再走正常补位
         pendingEnqueue.removeAll { pool ->
             entries.any { it.path == pool.path && it.size == pool.size && it.timestamp == pool.timestamp }
         }
         TransferStore.enqueueBatch(q, wanted)   // 幂等：已入队原位刷新，不产生重复条目
-        TransferStore.prioritize(q, wanted)     // 提头 + 收回 QUEUED
-        interruptAndRestart(ctx, guid)          // 打断 + 等旧线程退出后从队头起跑
+        // The shared scheduler handles priority at safe transfer boundaries.
+        DownloadService.start(ctx)
     }
 
     /**
@@ -763,6 +783,7 @@ object LiveTransferCenter {
 
     /** 卡变化暂停：开关保持开、巡检停 —— 用户关掉再开 = 重建基准。 */
     private fun pause(msg: String) {
+        baselineReady = false
         active = false
         // ★ 2.10（D4）：暂停也必须收掉常驻巡检标志——否则 pollLoop 会在下一轮把
         //   换卡后的目录再全量对账一遍（每 4s 重读一遍，纯浪费）；重连后自动重启。
@@ -780,34 +801,41 @@ object LiveTransferCenter {
      * （条目数 + 锚点）。开关打开那一刻已存在的照片**不传**（只拍新拍的）。
      */
     private suspend fun buildBaseline(host: String): Boolean {
-        knownFiles.clear()
-        knownDirs.clear()
-        pendingNew.clear()
-        enqueuedIds.clear()   // ★ 2.10（F2）：重建基准 = 重新认账，入队幂等册同步清空
-        stableRounds = 0
+        // Gather a complete snapshot privately. Partial scans never become a live baseline.
+        val files = HashMap<String, Pair<Long, Long>>()
+        val dirs = HashMap<String, DirWatch>()
         val dcim = readAllPages(host, "/DCIM") ?: return false
-        for (e in dcim) {
-            if (e.isDir) {
-                scanNewDir(host, e.path, asBaseline = true)
+        for (entry in dcim) {
+            if (entry.isDir) {
+                val children = readAllPages(host, entry.path) ?: return false
+                dirs[entry.path] = DirWatch(children.size, children.firstOrNull()?.name)
+                for (child in children) if (!child.isDir && isImage(child)) {
+                    files[child.path] = child.size to child.timestamp
+                }
                 delay(SCAN_DIR_GAP_MS)
-            } else if (isImage(e)) {
-                knownFiles[e.path] = e.size to e.timestamp
-            }
+            } else if (isImage(entry)) files[entry.path] = entry.size to entry.timestamp
         }
-        Log.d(TAG, "基准建立：${knownDirs.size} 个目录 · ${knownFiles.size} 张")
+        currentCoroutineContext().ensureActive()
+        if (!patrolling || ConnectionCenter.host != host) return false
+        knownFiles.clear()
+        knownFiles.putAll(files)
+        knownDirs.clear()
+        knownDirs.putAll(dirs)
+        pendingNew.clear()
+        enqueuedIds.clear()
+        stableRounds = 0
+        baselineReady = true
+        Log.d(TAG, "完整基准建立：${dirs.size} 个目录 · ${files.size} 张")
         return true
     }
 
     private suspend fun readAllPages(host: String, dir: String): List<ObjectRepository.FtpEntry>? {
-        val all = ArrayList<ObjectRepository.FtpEntry>()
-        var offset = 0
+        val scan = CompleteDirectoryScan<ObjectRepository.FtpEntry>()
         while (true) {
-            val page = listPageSafe(host, dir, offset, scan = true) ?: return if (all.isEmpty()) null else all
-            all.addAll(page.entries)
-            if (!page.hasMore || page.nextOffset <= offset) break
-            offset = page.nextOffset
+            val page = listPageSafe(host, dir, scan.offset, scan = true) ?: return null
+            if (!scan.accept(page.entries, page.hasMore, page.nextOffset)) return null
+            if (scan.complete) return scan.result()
         }
-        return all
     }
 
     // ============================================================
@@ -877,34 +905,15 @@ object LiveTransferCenter {
 
     /** 重连成功后重建基准、恢复巡检（幂等）。 */
     private suspend fun resumeMonitoring() {
-        if (!enabled || active || resuming) return
-        val host = ConnectionCenter.host ?: return
-        val guid = ConnectionCenter.camera?.guidHex ?: return
+        if (!enabled || active) return
         val wanted = sessionGuid
+        val guid = ConnectionCenter.camera?.guidHex ?: return
         if (wanted != null && guid != wanted) {
-            Log.w(TAG, "重连到的是另一台相机（$guid ≠ $wanted）：关掉边拍边传")
-            disable()
+            disable(persistPreference = false)
             return
         }
-        resuming = true
-        try {
-            sessionGuid = guid
-            expectReconnect = false
-            statusText = "正在启动同步…"
-            Log.d(TAG, "重连成功，重建基准（$guid）")
-            val ok = buildBaseline(host)
-            if (!enabled) return
-            if (!ok) {
-                statusText = "基准建立失败，请重试"
-                return
-            }
-            active = true
-            statusText = "监控中 · 已自动接收 $autoCount 张"
-            pollJob?.cancel()
-            pollJob = scope?.launch { pollLoop(host, guid) }
-        } finally {
-            resuming = false
-        }
+        expectReconnect = false
+        onConnectionEstablished(appContext)
     }
 
     // ============================================================
@@ -917,7 +926,7 @@ object LiveTransferCenter {
     }
 
     private fun markPending(e: ObjectRepository.FtpEntry) {
-        pendingNew[e.path] = Pending(e.size, e.timestamp, 0)
+        pendingNew[e.path] = Pending(e.size, e.timestamp)
     }
 
     /** 路径最后一段（confirmPending 用 stat 结果重建 FtpEntry 时取文件名）。 */
@@ -951,6 +960,8 @@ object LiveTransferCenter {
             } else {
                 ObjectRepository.listPage(host, dir, offset, 256)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.d(TAG, "listPage($dir @$offset) 失败：${e.message}")
             null

@@ -44,7 +44,10 @@ public class ThumbPrefetcher {
      * ★ 1.0：见 {@link ThumbnailExtractor#extractSmallBundle}），
      * 512 条约 3.2 MB —— 相机堆能承受，换来的是一次预热覆盖整个目录，用户滚到哪都命中。
      */
-    private static final int MAX_ENTRIES = 512;
+    private static final int MAX_ENTRIES = Runtime.getRuntime().maxMemory() <= 32L * 1024 * 1024 ? 128 : 512;
+    private static final long SMALL_MAX_BYTES = Runtime.getRuntime().maxMemory() <= 32L * 1024 * 1024
+            ? 1024L * 1024 : 3L * 1024 * 1024;
+    private long smallCacheBytes;
 
     /** 常驻 worker 数（2.6：单线程 → 2；★ 2.10-fix：回到 **1** —— 单核相机上
      *  两路解析只会自相争抢 SD/CPU，且与请求路径的现解析叠加时更易触发长读窗冲突；
@@ -66,13 +69,16 @@ public class ThumbPrefetcher {
      *   砍到 16 条把驻留压到 ~15 MB，给解析峰值留足空间。
      */
     private static final int PREVIEW_MAX_ENTRIES = 16;
+    private static final long PREVIEW_MAX_BYTES = Runtime.getRuntime().maxMemory() <= 32L * 1024 * 1024
+            ? 2L * 1024 * 1024 : 6L * 1024 * 1024;
+    private long previewCacheBytes;
 
     private final File rootDir;
     private final LinkedHashMap<String, byte[]> cache =
             new LinkedHashMap<String, byte[]>(16, 0.75f, true) {
                 protected boolean removeEldestEntry(
                         Map.Entry<String, byte[]> eldest) {
-                    return size() > MAX_ENTRIES;
+                    return false; // Eviction and byte accounting are performed before insertion.
                 }
             };
 
@@ -120,7 +126,7 @@ public class ThumbPrefetcher {
                     synchronized (lock) {
                         doneCount++;
                         if (jpg != null) {
-                            cache.put(relPath, jpg);
+                            cacheSmallLocked(relPath, jpg);
                         }
                     }
                 }
@@ -128,6 +134,20 @@ public class ThumbPrefetcher {
 
     public ThumbPrefetcher(File rootDir) {
         this.rootDir = rootDir;
+    }
+
+    /** Caller holds lock; small previews also need a byte limit on 24 MiB devices. */
+    private void cacheSmallLocked(String path, byte[] bytes) {
+        byte[] old = cache.remove(path);
+        if (old != null) smallCacheBytes -= old.length;
+        if (bytes.length > SMALL_MAX_BYTES) return;
+        java.util.Iterator<Map.Entry<String, byte[]>> it = cache.entrySet().iterator();
+        while (it.hasNext() && (smallCacheBytes + bytes.length > SMALL_MAX_BYTES || cache.size() >= MAX_ENTRIES)) {
+            smallCacheBytes -= it.next().getValue().length;
+            it.remove();
+        }
+        cache.put(path, bytes);
+        smallCacheBytes += bytes.length;
     }
 
     /** 命中返回缓存字节；未命中返回 null（调用方回落实时提取） */
@@ -156,9 +176,26 @@ public class ThumbPrefetcher {
             return;
         }
         synchronized (lock) {
-            previewCache.put(relPath, bundled);
+            cachePreviewLocked(relPath, bundled);
         }
     }
+    /** Caller holds lock. Budget by bytes as JPG previews may be several MB each. */
+    private void cachePreviewLocked(String path, byte[] bytes) {
+        byte[] old = previewCache.remove(path);
+        if (old != null) previewCacheBytes -= old.length;
+        // Oversized previews are still served to the phone, just not retained on the camera.
+        if (bytes.length > PREVIEW_MAX_BYTES) return;
+        java.util.Iterator<Map.Entry<String, byte[]>> it = previewCache.entrySet().iterator();
+        while (it.hasNext() && (previewCacheBytes + bytes.length > PREVIEW_MAX_BYTES
+                || previewCache.size() >= PREVIEW_MAX_ENTRIES)) {
+            Map.Entry<String, byte[]> oldest = it.next();
+            previewCacheBytes -= oldest.getValue().length;
+            it.remove();
+        }
+        previewCache.put(path, bytes);
+        previewCacheBytes += bytes.length;
+    }
+
 
     // ===== 协议命令 =====
 
@@ -243,6 +280,26 @@ public class ThumbPrefetcher {
             t.setDaemon(true);
             workers.add(t);
             t.start();
+        }
+    }
+
+    private boolean remotePaused;
+
+    /** Release dispensable cached previews before CameraEx allocates its live-view buffers. */
+    public void pauseForRemote() {
+        synchronized (lock) {
+            remotePaused = STATE_RUNNING.equals(state);
+            if (remotePaused) state = STATE_PAUSED;
+            previewCache.clear();
+            previewCacheBytes = 0;
+        }
+    }
+
+    public void resumeFromRemote() {
+        synchronized (lock) {
+            if (remotePaused && STATE_PAUSED.equals(state)) state = STATE_RUNNING;
+            remotePaused = false;
+            lock.notifyAll();
         }
     }
 
@@ -474,7 +531,7 @@ public class ThumbPrefetcher {
                 synchronized (lock) {
                     previewDoneCount++;
                     if (bundled != null) {
-                        previewCache.put(rel, bundled);
+                        cachePreviewLocked(rel, bundled);
                     }
                 }
             } finally {

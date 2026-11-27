@@ -33,8 +33,11 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
+import io.github.bi2qfa.alphasync.data.SettingsRepo
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import io.github.bi2qfa.alphasync.ui.components.ViewportPreviews
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -174,8 +177,8 @@ fun SyncScreen(
         exitSelectMode()
     }
 
-    fun doStartNow(targets: List<ObjectRepository.FtpEntry>) {
-        LiveTransferCenter.startNow(targets)
+    fun doStartNow(targets: List<ObjectRepository.FtpEntry>, priority: Boolean = false) {
+        LiveTransferCenter.startNow(targets, priority)
         exitSelectMode()
     }
 
@@ -197,6 +200,54 @@ fun SyncScreen(
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                shape = MaterialTheme.shapes.extraLarge,
+                color = MaterialTheme.colorScheme.surfaceContainer,
+            ) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("自动同步", style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f))
+                        Text(if (LiveTransferCenter.enabled) "已开启" else "已关闭",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (LiveTransferCenter.enabled) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(8.dp))
+                        Switch(
+                            checked = LiveTransferCenter.enabled,
+                            onCheckedChange = { on ->
+                                if (on) LiveTransferCenter.enable(context) else LiveTransferCenter.disable()
+                            },
+                            enabled = connected || LiveTransferCenter.enabled,
+                        )
+                    }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                            Text("下载 JPG", modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.labelLarge)
+                            Switch(checked = SettingsRepo.autoSyncJpg, onCheckedChange = {
+                                SettingsRepo.updateAutoSyncFormats(it, SettingsRepo.autoSyncRaw)
+                            })
+                        }
+                        Spacer(Modifier.width(16.dp))
+                        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                            Text("下载 RAW", modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.labelLarge)
+                            Switch(checked = SettingsRepo.autoSyncRaw, onCheckedChange = {
+                                SettingsRepo.updateAutoSyncFormats(SettingsRepo.autoSyncJpg, it)
+                            })
+                        }
+                    }
+                    Text(
+                        if (!SettingsRepo.autoSyncJpg && !SettingsRepo.autoSyncRaw)
+                            "两项均关闭：不自动下载新文件，预览仍正常加载"
+                        else "仅下载之后发现的新照片；两项均开启时下载 JPG 和 ARW",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
             // ===== 工具条药丸（与文件页同语言）：[自动同步 + 开关] …… [排序] [视图] =====
             Surface(
                 modifier = Modifier
@@ -209,39 +260,7 @@ fun SyncScreen(
                     Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("自动同步", style = MaterialTheme.typography.labelLarge)
-                    Spacer(Modifier.width(4.dp))
-                    // 开关可用性沿用原主页开关逻辑：未连接置灰；相机后台化重连期间
-                    // （enabled=true 但 connected=false）仍可随时关掉。
-                    // ★ 2.11 第二轮（§5.2 定版）：大 Switch → 与工具条同规格的**图标钮**
-                    //   （22dp）。开启 = primary + 实心（filled）；关闭 = 默认色空心。
-                    //   可用性沿用原逻辑：未连接置灰；相机后台化重连期间仍可随时关掉。
-                    val syncSource = remember { MutableInteractionSource() }
-                    IconButton(
-                        onClick = {
-                            if (LiveTransferCenter.enabled) {
-                                LiveTransferCenter.disable()
-                            } else if (ConnectionCenter.state == ConnectionCenter.State.CONNECTED) {
-                                LiveTransferCenter.enable(context)
-                            }
-                        },
-                        enabled = connected || LiveTransferCenter.enabled,
-                        interactionSource = syncSource,
-                    ) {
-                        MsIcon(
-                            icon = MsIcon.SYNC,
-                            contentDescription = if (LiveTransferCenter.enabled) "自动同步 开" else "自动同步 关",
-                            modifier = Modifier.size(22.dp),
-                            size = 22.dp,
-                            tint = if (LiveTransferCenter.enabled) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                            filled = LiveTransferCenter.enabled,
-                            interactionSource = syncSource,
-                        )
-                    }
+                    Text("同步列表", style = MaterialTheme.typography.labelLarge)
                     Spacer(Modifier.weight(1f))
                     // ★ 2.11 第二轮（§5.4）：[选择模式] 钮（与文件页同款，位于排序左边）
                     val selModeSource = remember { MutableInteractionSource() }
@@ -325,7 +344,7 @@ fun SyncScreen(
             // ===== 状态行（开关开启时显示；含"等待相机…/已暂停"这类关键状态） =====
             if (LiveTransferCenter.enabled && LiveTransferCenter.statusText.isNotBlank()) {
                 Text(
-                    LiveTransferCenter.statusText,
+                    LiveTransferCenter.downloadStatusText(),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 4.dp),
@@ -340,6 +359,7 @@ fun SyncScreen(
             // ===== 内容：九宫格（默认）/ 列表 =====
             if (gridView) {
                 val gridState = rememberLazyGridState()
+                ViewportPreviews(entries) { gridState.layoutInfo.visibleItemsInfo.map { it.index } }
                 // 双击标题回顶（消费基线：旧信号不在分支重建后重放）
                 LaunchedEffect(topTick) {
                     if (topTick > topTickSeen) {
@@ -405,6 +425,7 @@ fun SyncScreen(
                 }
             } else {
                 val listState = rememberLazyListState()
+                ViewportPreviews(entries) { listState.layoutInfo.visibleItemsInfo.map { it.index } }
                 LaunchedEffect(topTick) {
                     if (topTick > topTickSeen) {
                         topTickSeen = topTick
@@ -503,10 +524,10 @@ fun SyncScreen(
                         },
                     )
                     ExpressiveButton(
-                        text = "立刻开始传输",
+                        text = "优先下载",
                         onClick = {
                             actionTargets = null
-                            doStartNow(targets)
+                            doStartNow(targets, priority = true)
                         },
                         modifier = Modifier.fillMaxWidth(),
                         tonal = true,
@@ -519,6 +540,11 @@ fun SyncScreen(
                                 animated = false,
                             )
                         },
+                    )
+                    ExpressiveButton(
+                        text = "正常下载（预览优先）",
+                        onClick = { actionTargets = null; doStartNow(targets) },
+                        modifier = Modifier.fillMaxWidth(), tonal = true,
                     )
                     ExpressiveButton(
                         text = "取消",
@@ -553,6 +579,14 @@ fun SyncScreen(
                 onOpenSettings = onOpenSettings,
                 onSwitchDevice = onSwitchDevice,
                 showSelectAction = false,
+                onDownload = { photo, priority ->
+                    if (connected) {
+                        LiveTransferCenter.startNow(listOf(photo), priority)
+                        android.widget.Toast.makeText(context,
+                            if (priority) "已加入优先下载队列" else "已加入下载队列",
+                            android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                },
             )
         }
     }

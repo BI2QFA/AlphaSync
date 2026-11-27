@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * - 纯 Java、零 Android 依赖 → 桌面 desktop-test 可整体拉起做真 socket 断言。
  */
 public class PtpIpServer {
+    public static final boolean DIRECT_CONNECT = true;
 
     // ============================================================
     // 对外契约
@@ -166,6 +167,8 @@ public class PtpIpServer {
      * 控制循环之前。成功后本方法把手机设备名交给业务侧落表，服务器随即在同一条
      * 连接上进入控制循环 —— 手机端不需要重连。
      */
+    public interface ResourceHandler { void appendResourceStats(StringBuilder json); }
+
     public interface PairingHandler {
         /** 该手机是否已在配对表里。 */
         boolean isDevicePaired(byte[] guid8);
@@ -939,9 +942,10 @@ public class PtpIpServer {
             PairingHandler ph = pairingHandler;
             // 走配对路径的条件：装了配对功能 且 这台手机尚未配对 且 配对窗口开着。
             // 三者缺一就落到下面的常规判定，从而在 ph == null 时行为与配对引入前一致。
-            boolean pairPath = ph != null && !ph.isDevicePaired(guid8) && ph.isPairingOpen();
+            // This build permits direct local-network connections without a pairing exchange.
+            boolean pairPath = !DIRECT_CONNECT && ph != null && !ph.isDevicePaired(guid8) && ph.isPairingOpen();
 
-            if (!pairPath && !handler.allowInitiator(guid8)) {
+            if (!DIRECT_CONNECT && !pairPath && !handler.allowInitiator(guid8)) {
                 // **全链路唯一的准入判定**：不在配对表里 → 只能走配对，走不了就拒。
                 AppLog.w("Net", "拒绝接入：不在配对表（pairPath=" + pairPath + "）");
                 send(PtpCodec.initFail(PtpCodec.FAIL_NOT_PAIRED));
@@ -1102,7 +1106,13 @@ public class PtpIpServer {
                 return false;
             }
             // 先落表、再回 OK：回包即代表"已存好"
-            ph.onPaired(devIdA, peerDeviceName);
+            try {
+                ph.onPaired(devIdA, peerDeviceName);
+            } catch (RuntimeException failure) {
+                AppLog.w("Pair", "配对保存失败: " + failure);
+                send(PtpCodec.opRspBlob(PtpCodec.RC_GENERAL_ERROR, b2.txId, null, null));
+                return false;
+            }
             send(PtpCodec.opRspBlob(PtpCodec.RC_OK, b2.txId, null, null));
             return true;
         }
@@ -1258,6 +1268,7 @@ public class PtpIpServer {
             SJson.member(sb, "lens", handler.lensName());
             SJson.member(sb, "sdT", handler.sdTotal());
             SJson.member(sb, "sdU", handler.sdUsed());
+            if (handler instanceof ResourceHandler) ((ResourceHandler) handler).appendResourceStats(sb);
             send(PtpCodec.opRspBlob(PtpCodec.RC_OK, tx,
                     new int[]{handler.batteryPct(), handler.hasLens() ? 1 : 0},
                     utf8(SJson.endObj(sb))));

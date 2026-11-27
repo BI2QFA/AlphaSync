@@ -18,14 +18,14 @@ android {
     defaultConfig {
         // ★ 发布包名（GitHub 组织命名）：与代码包 namespace 分离是 AGP 的标准做法，
         //   全部源码的 package 声明无需跟着动。安装器身份以它为准。
-        applicationId = "io.github.bi2qfa.alphasync"
+        applicationId = "io.github.bi2qfa.alphasync.networkfix"
         minSdk = 24          // Android 7.0（AlphaSync 需求：向下兼容到 7.0）
         targetSdk = 36
         // AlphaSync 1.0（vc 1，双端同步）：功能集 = 改名前的 2.12 代（倒序分页、
         //   小图 EXIF 随传捆绑包、PING JSON 实时包等）。**零兼容**：不与任何老版本
         //   互通（协议已无回退分支），两端必须一起装。
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 44
+        versionName = "1.0-direct.44"
     }
 
     signingConfigs {
@@ -54,7 +54,8 @@ android {
             signingConfig = signingConfigs.getByName("alphasync")
         }
         debug {
-            signingConfig = signingConfigs.getByName("alphasync")
+            // 独立测试包，使用本地 debug 签名，可与原版共存。
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

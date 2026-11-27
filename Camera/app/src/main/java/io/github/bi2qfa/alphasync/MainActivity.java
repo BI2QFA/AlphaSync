@@ -10,6 +10,7 @@ import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.net.wifi.SupplicantState;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -158,7 +159,8 @@ public class MainActivity extends Activity {
     private static final long DELAY_WIFI_ENABLE_MS = 2000;
     private static final long DELAY_FATAL_CHECK_MS = 5000;
     private static final long EXIT_CONFIRM_CAP_MS = 10000;
-    private static final int STATION_POLLS_MAX = 120;       // Wi-Fi 客户端轮询上限（500ms × 120 = 60s，含使能+关联+DHCP）
+    private static final long STATION_TIMEOUT_MS = 60000;
+    private static final long STATION_POLL_MS = 250;
     /** 后台化交接前"等无线电拆净"的上限（与退出链同款轮询确认；超时也继续交接）。 */
     private static final long BG_RADIO_DOWN_CAP_MS = 10000;
     /**
@@ -261,6 +263,10 @@ public class MainActivity extends Activity {
             // 主界面与服务状态块**共用同一份正文**（两屏各有一块），所以心跳必须两屏都跑 ——
             // 否则在配对页翻到"服务状态"那一块，看到的会是进屏那一刻的旧文本（服务是后台
             // 起来的，等它就绪时用户多半已经在配对页上了）。
+            // Resolve a late SSID for display without holding up IP-based service startup.
+            if (phase == PH_RUNNING && MODE_WIFI.equals(savedMode) && ssid == null) {
+                ssid = stationSsid();
+            }
             if (screen == SCR_MAIN || screen == SCR_PAIRING) {
                 String now = buildMainStatusText();
                 boolean textChanged = !now.equals(lastMainStatus);
@@ -406,7 +412,7 @@ public class MainActivity extends Activity {
     /** 热点信息块的名称与密码两行（**只剩配对页一份**——主界面热点块已并入服务状态）。 */
     private TextView pairingHotName, pairingHotPass;
     /** 主界面按钮焦点：0=左键 1=右键 */
-    private int mainFocus = 0;
+    private int mainFocus = 1;
     /** 当前正文块：0=连接示意 1=热点信息 2=服务状态 */
     private int mainBlock = 0;
 
@@ -446,8 +452,7 @@ public class MainActivity extends Activity {
     // wipeModeAndRechoose() 一起拿掉，不留半截功能。改连接方式的入口在"连接设置"里。
     private final String[][] menuItems = {
             {"连接设置", "未设置", ACT_MODE},
-            {"进入配对模式", "", ACT_PAIR},
-            {"已配对设备", "无", ACT_PAIRED},
+            {"遥控拍摄", "", "webcontrol"},
             {"关于", "", ACT_ABOUT},
             {"退出应用程序", "", ACT_EXIT},
     };
@@ -467,7 +472,7 @@ public class MainActivity extends Activity {
      */
     private final String[][] menuItemsPairingMode = {
             {"连接设置", "未设置", ACT_MODE},
-            {"已配对设备", "无", ACT_PAIRED},
+            {"遥控拍摄", "", "webcontrol"},
             {"关于", "", ACT_ABOUT},
             {"退出应用程序", "", ACT_EXIT},
     };
@@ -504,6 +509,17 @@ public class MainActivity extends Activity {
             requestPairing();
         } else if (ACT_PAIRED.equals(act)) {
             showScreen(SCR_PAIRED);
+        } else if ("webcontrol".equals(act)) {
+            // Keep the existing network/PTP services alive while the child owns CameraEx.
+            jumpingToSystem = true;
+            if (thumbPrefetcher != null) thumbPrefetcher.pauseForRemote();
+            try {
+                startActivity(new Intent(this, com.sony.pmca.webcontrol.MacroServerActivity.class));
+            } catch (Throwable t) {
+                jumpingToSystem = false;
+                if (thumbPrefetcher != null) thumbPrefetcher.resumeFromRemote();
+                AppLog.w("Remote", "无法打开遥控：" + t);
+            }
         } else if (ACT_ABOUT.equals(act)) {
             showScreen(SCR_ABOUT);
         } else if (ACT_BACKGROUND.equals(act)) {
@@ -562,8 +578,9 @@ public class MainActivity extends Activity {
     private IntentFilter iFilter;
 
     /** Wi-Fi 客户端模式关联轮询 */
-    private int stationPolls = 0;
-    private int ssidRetries = 0;
+    private long stationStartedAt;
+    private boolean stationReconnectRequested;
+    private long stationCleanupDeadline;
     private boolean stationNudged = false;
     /** Wi-Fi 模式：null=尚未判定；TRUE=启动时 Wi-Fi 是关的、由我们打开（退出时按铁律关回）；FALSE=原本就开着（退出不动） */
     private Boolean wifiEnabledByUs = null;
@@ -600,7 +617,7 @@ public class MainActivity extends Activity {
 
     /** 本机是否已有已配对设备（配对表在 onCreate 就建好了，服务没起也能问）。 */
     private boolean hasPairedDevice() {
-        return pairingStore != null && pairingStore.size() > 0;
+        return PtpIpServer.DIRECT_CONNECT || (pairingStore != null && pairingStore.size() > 0);
     }
     /** 连接设置页来路：true=从配对页菜单进来（选完**回配对页**，见 finishModeChoice）。 */
     private boolean modeFromPairing = false;
@@ -740,7 +757,6 @@ public class MainActivity extends Activity {
         DeviceInfo.startLensSampler();
 
         AppLog.i("Life", "onCreate：AlphaSync " + APP_VERSION
-                + "，固件 " + DeviceInfo.getFirmwareVersion()
                 + "，协议 " + PtpCodec.formatProtoVersion(PtpIpServer.PROTO_VERSION)
                 + "，sdk=" + Build.VERSION.SDK_INT);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
@@ -1008,6 +1024,8 @@ public class MainActivity extends Activity {
 
         iFilter = new IntentFilter();
         iFilter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
+        iFilter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+        iFilter.addAction(WifiManager.SUPPLICANT_STATE_CHANGED_ACTION);
         iFilter.addAction(RadioWrapper.ACTION_DIRECT_STATE_CHANGED);
         iFilter.addAction(RadioWrapper.ACTION_GROUP_CREATE_SUCCESS);
         iFilter.addAction(RadioWrapper.ACTION_GROUP_CREATE_FAILURE);
@@ -1092,6 +1110,7 @@ public class MainActivity extends Activity {
             }
         }
         jumpingToSystem = false;
+        if (thumbPrefetcher != null) thumbPrefetcher.resumeFromRemote();
         if (shuttingDown) return;
         if (isAirplaneModeOn()) {
             daFinishOnly();
@@ -1429,7 +1448,7 @@ public class MainActivity extends Activity {
             case ScalarInput.ISV_KEY_EV_COMPENSATION: return "曝光补偿转盘";
             case ScalarInput.ISV_KEY_IRIS_DIAL: return "光圈转盘";
             case ScalarInput.ISV_KEY_UNKNOWN: return "UNKNOWN";
-            case ScalarInput.KEY_NOT_SUPPORTED: return "NOT_SUPPORTED";
+            case -1: return "NOT_SUPPORTED"; // KEY_NOT_SUPPORTED in AlphaSync's original stub.
             default: return "0x" + Integer.toHexString(scan);
         }
     }
@@ -1626,6 +1645,7 @@ public class MainActivity extends Activity {
         //    ★ 先记下"调用方**原本**想去哪一屏"，守卫②要用它判断这次算不算"刚从别处
         //      掉进无设备状态"（改写过的 target 会把这个信息抹掉）。
         final int requested = target;
+        if (target == SCR_PAIRING) target = SCR_MAIN;
         if (target == SCR_MAIN && !hasPairedDevice()) {
             AppLog.w("UI", "无已配对设备：主界面不立 → 改走配对流程");
             target = SCR_PAIRING;
@@ -1702,10 +1722,10 @@ public class MainActivity extends Activity {
         dlgExiting.setVisibility(target == DLG_EXITING ? View.VISIBLE : View.GONE);
 
         if (target == SCR_MAIN) {
-            // 主界面有了常驻按钮行：进屏即把焦点放到左键，并把文案/正文块刷成当前状态
-            mainFocus = 0;
+            // 主界面有了常驻按钮行：进屏即把焦点放到后台运行，并把文案/正文块刷成当前状态
+            mainFocus = 1;
             refreshScreens();
-            btnMainLeft.requestFocus();
+            btnMainRight.requestFocus();
         } else if (target == SCR_MENU) {
             // 菜单**按来路**取模型：从配对页按垃圾桶进来的那一份藏着"进入配对模式"
             // （已经在配对模式里了），其余一字不差（见 activeMenu）。
@@ -2287,8 +2307,8 @@ public class MainActivity extends Activity {
     private void updateAboutText() {
         String id = pairingStore != null ? pairingStore.deviceIdHex() : null;
         aboutTitle.setText("AlphaSync " + APP_VERSION);
-        aboutMeta.setText("配套手机端 AlphaSync " + APP_VERSION + " 使用\n开发者：BI2QFA");
-        aboutCode.setText("本机设备码：" + shortCode(id));
+        aboutMeta.setText("配套手机端 AlphaSync 直连版使用\n开发者：BI2QFA");
+        aboutCode.setText("连接方式：免配对直连");
     }
 
     /**
@@ -2778,6 +2798,18 @@ public class MainActivity extends Activity {
     }
 
     private void handleEvent(Intent intent) {
+        // Station broadcasts wake the IP check, never the hotspot state machine.
+        if (!shuttingDown && !inBackground && !sReattachPending
+                && MODE_WIFI.equals(savedMode) && stationWaiting) {
+            String stationAction = intent.getAction();
+            if (WifiManager.WIFI_STATE_CHANGED_ACTION.equals(stationAction)
+                    || WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(stationAction)
+                    || WifiManager.SUPPLICANT_STATE_CHANGED_ACTION.equals(stationAction)) {
+                handler.removeCallbacks(stationPoll);
+                handler.post(stationPoll);
+            }
+            return;
+        }
         // 热点启动状态机守卫：只允许"热点模式 + 非关闭/切换期"驱动本状态机。
         // 此前切到 Wi-Fi 模式后接收器未注销，startStationFlow 一开 Wi-Fi 总开关，
         // WIFI_STATE_ENABLED 广播就把这套状态机唤醒——它继续去使能 Direct、
@@ -3005,6 +3037,7 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(delayedDirectEnableRetry);
         handler.removeCallbacks(stalledStartupCheck);
         handler.removeCallbacks(stationPoll);
+        handler.removeCallbacks(stationCleanup);
     }
 
     // ===== Wi-Fi 客户端模式（用户要求：启动即自动打开 Wi-Fi，不跳设置） =====
@@ -3017,33 +3050,38 @@ public class MainActivity extends Activity {
         updateMainStatus();
         // 双保险①：热点遗留的延时回调（延时使能/看门狗）一并撤掉
         removeRadioCallbacks();
-        // 双保险②：若组壳仍存活（切换时关闭命令丢失或沉降慢），removeGroup
-        // 拆掉并确认消失，否则无线电被 GO 占用，Wi-Fi 关联不上——
-        // "显示 Wi-Fi 实为热点"
-        try {
-            if (radio.getLiveGroup() != null) {
-                long deadline = SystemClock.elapsedRealtime() + 8000;
-                while (SystemClock.elapsedRealtime() < deadline) {
-                    try {
-                        radio.removeGroup();
-                    } catch (Throwable t) {
-                    }
-                    try {
-                        radio.issueDirectOff();
-                    } catch (Throwable t) {
-                    }
-                    if (radio.getLiveGroup() == null) break;
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException e) {
-                        break;
+        stationWaiting = false;
+        // The old receiver was only registered in hotspot mode. Subscribe here too,
+        // replacing any previous registration so retries do not duplicate callbacks.
+        try { unregisterReceiver(receiver); } catch (Throwable ignored) { }
+        try { registerReceiver(receiver, iFilter); } catch (Throwable ignored) { }
+        // Radio teardown remains bounded but never sleeps on the UI thread.
+        stationCleanupDeadline = SystemClock.elapsedRealtime() + 8000;
+        handler.post(stationCleanup);
+    }
+
+    private final Runnable stationCleanup = new Runnable() {
+        public void run() {
+            if (shuttingDown || !MODE_WIFI.equals(savedMode)) return;
+            try {
+                if (radio.getLiveGroup() != null) {
+                    try { radio.removeGroup(); } catch (Throwable ignored) { }
+                    try { radio.issueDirectOff(); } catch (Throwable ignored) { }
+                    if (radio.getLiveGroup() != null &&
+                            SystemClock.elapsedRealtime() < stationCleanupDeadline) {
+                        handler.postDelayed(this, 500);
+                        return;
                     }
                 }
-            }
-        } catch (Throwable t) {
+            } catch (Throwable ignored) { }
+            enableStationAndPoll();
         }
+    };
+
+    private void enableStationAndPoll() {
+        if (shuttingDown || !MODE_WIFI.equals(savedMode)) return;
         // Tweak EnableWifi 同款：总开关关着就打开。系统 supplicant 会自动连接
-        // 系统里已绑定（保存过密码）的网络——不碰配置、不 reconnect、不跳设置。
+        // 系统里已绑定（保存过密码）的网络；若 supplicant 空闲，下面仅请求一次 reconnect。
         // 记录启动前的 Wi-Fi 状态：若是我们打开的，退出时按铁律关回（零残留）。
         try {
             if (wifiEnabledByUs == null) {
@@ -3053,15 +3091,18 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
         }
         try {
-            wifiManager.setWifiEnabled(true);
+            if (wifiManager.getWifiState() != WifiManager.WIFI_STATE_ENABLED
+                    && wifiManager.getWifiState() != WifiManager.WIFI_STATE_ENABLING)
+                wifiManager.setWifiEnabled(true);
         } catch (Throwable t) {
         }
-        stationPolls = 0;
-        ssidRetries = 0;
+        stationStartedAt = SystemClock.elapsedRealtime();
+        stationReconnectRequested = false;
         stationNudged = false;
         stationWaiting = true;
         handler.removeCallbacks(stationPoll);
-        handler.postDelayed(stationPoll, 500);
+        handler.removeCallbacks(stationCleanup);
+        handler.post(stationPoll);
     }
 
     private final Runnable stationPoll = new Runnable() {
@@ -3075,7 +3116,8 @@ public class MainActivity extends Activity {
                 state = WifiManager.WIFI_STATE_DISABLED;
             }
             // 使能竞态兜底：8 秒后总开关仍未打开，幂等补发一次（Tweak 同款调用）
-            if (state != WifiManager.WIFI_STATE_ENABLED && stationPolls >= 16 && !stationNudged) {
+            long elapsed = SystemClock.elapsedRealtime() - stationStartedAt;
+            if (state != WifiManager.WIFI_STATE_ENABLED && elapsed >= 8000 && !stationNudged) {
                 stationNudged = true;
                 try {
                     wifiManager.setWifiEnabled(true);
@@ -3086,12 +3128,7 @@ public class MainActivity extends Activity {
             // 不接受"已关联但 IP 未下发"（此前 DHCP 晚一拍即误报"FTP 启动失败"）
             String ip = state == WifiManager.WIFI_STATE_ENABLED ? stationIpAddress() : null;
             if (ip != null) {
-                // IP 已到手但 SSID 偶发滞后：最多再等 3 秒取名称再切运行态
-                if (stationSsid() == null && ssidRetries < 6) {
-                    ssidRetries++;
-                    handler.postDelayed(this, 500);
-                    return;
-                }
+                // DHCP address is sufficient: the cosmetic SSID must not delay service startup.
                 stationWaiting = false;
                 currentIp = ip;
                 ssid = stationSsid();
@@ -3101,18 +3138,32 @@ public class MainActivity extends Activity {
                 }
                 disableAutoPowerOff();
                 phase = PH_RUNNING;
-                AppLog.i("Radio", "接入点就绪：SSID=" + ssid + " IP=" + currentIp);
+                AppLog.i("Radio", "接入点就绪：SSID=" + ssid + " IP=" + currentIp
+                        + " Wi-Fi耗时=" + elapsed + "ms");
                 updateMainStatus();
                 return;
             }
-            if (stationPolls++ >= STATION_POLLS_MAX) {
+            // Ask supplicant to reconnect once when idle. Do not interrupt scanning,
+            // association, authentication or DHCP, and do not rewrite saved networks.
+            if (state == WifiManager.WIFI_STATE_ENABLED && !stationReconnectRequested) {
+                try {
+                    WifiInfo connection = wifiManager.getConnectionInfo();
+                    SupplicantState supplicant = connection == null ? null : connection.getSupplicantState();
+                    if (supplicant == SupplicantState.DISCONNECTED || supplicant == SupplicantState.INACTIVE) {
+                        stationReconnectRequested = true;
+                        AppLog.i("Radio", "主动请求连接已保存网络：" + wifiManager.reconnect());
+                    }
+                } catch (Throwable ignored) { stationReconnectRequested = true; }
+            }
+            if (elapsed >= STATION_TIMEOUT_MS) {
                 stationWaiting = false;
                 phase = PH_FAILED;
                 errorMsg = "未检测到 Wi-Fi 连接\n请检查网络后按确定键重试";
                 updateMainStatus();
                 return;
             }
-            handler.postDelayed(stationPoll, 500);
+            handler.removeCallbacks(stationPoll);
+            handler.postDelayed(stationPoll, STATION_POLL_MS);
         }
     };
 
@@ -4062,7 +4113,7 @@ public class MainActivity extends Activity {
      * <ul>
      *   <li>键一（左）= **服务状态**（**热点/Wi-Fi 两种模式通用**：进块 2 / 再按回原块；
      *       热点信息已并入状态面板）；**还没选连接方式 → 铁律：一律弹连接方式选择**；</li>
-     *   <li>键二（右）= **后台运行**（弹确认后 enterBackgroundRun）；**Wi-Fi 模式**下
+     *   <li>键二（右）= **后台运行**（直接 enterBackgroundRun）；**Wi-Fi 模式**下
      *       服务状态展开中（块 2）变 **Wi-Fi 设置**（再给一条跳设置的近路）；
      *       **热点模式该键不变**（用户纠正："热点模式下点服务状态后后台运行不变"）。</li>
      * </ul>
@@ -4115,13 +4166,13 @@ public class MainActivity extends Activity {
             }
         } else {
             // 右：**Wi-Fi 模式**服务状态展开中 → Wi-Fi 设置（用户定版：只此一处变）；
-            //     热点模式恒"后台运行"；其余一律走"后台运行"确认
+            //     热点模式恒"后台运行"；其余直接进入后台运行
             //     （enterBackgroundRun 自带非运行态守卫）。
             if (MODE_WIFI.equals(savedMode) && mainBlock == 2) {
                 jumpToWifiSettings();
                 return;
             }
-            showConfirm(CONFIRM_BACKGROUND);
+            enterBackgroundRun();
             return;
         }
         refreshScreens();

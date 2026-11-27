@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.exifinterface.media.ExifInterface
@@ -31,14 +32,29 @@ import java.nio.channels.FileChannel
  */
 object LocalPhoto {
 
+    fun fileSize(context: Context, uri: Uri): Long? {
+        val resolver = context.contentResolver
+        val listedSize = runCatching {
+            resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                val column = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (column >= 0 && cursor.moveToFirst() && !cursor.isNull(column)) {
+                    cursor.getLong(column).takeIf { it >= 0 }
+                } else null
+            }
+        }.getOrNull()
+        return listedSize ?: runCatching {
+            resolver.openAssetFileDescriptor(uri, "r")?.use { it.length.takeIf { size -> size >= 0 } }
+        }.getOrNull()
+    }
+
     /** 内嵌预览的最小尺寸门槛：比这更小的都是 160×120 的小缩略图，点开看会糊。 */
     private const val MIN_PREVIEW_WIDTH = 800
 
     /** 单张内嵌图最多读多少字节（防畸形文件把内存吃光）。 */
     private const val MAX_EMBEDDED = 8 * 1024 * 1024
 
-    /** 解码上限边长：预览图本来就不大，但 JPG 可能是原图，按 2560 降采样封顶。 */
-    private const val MAX_DECODE_DIM = 2560
+    /** Legacy decoder/embedded RAW preview bound; modern images use an exact pixel budget. */
+    private const val MAX_DECODE_DIM = 4096
 
     /** 可在此查看器里显示的扩展名。 */
     val OPENABLE = setOf("jpg", "jpeg", "arw")
@@ -55,15 +71,34 @@ object LocalPhoto {
      * 阻塞 + 读文件，**必须在 IO 线程调用**。
      */
     fun loadPreview(context: Context, uri: Uri, name: String): ImageBitmap? = runCatching {
-        val bytes = if (name.endsWith(".arw", ignoreCase = true)) {
-            extractArwPreview(context, uri)
+        if (name.endsWith(".arw", ignoreCase = true)) {
+            extractArwPreview(context, uri)?.let { decodeSampled(it)?.asImageBitmap() }
+        } else if (android.os.Build.VERSION.SDK_INT >= 28) {
+            android.graphics.ImageDecoder.decodeBitmap(
+                android.graphics.ImageDecoder.createSource(context.contentResolver, uri),
+            ) { decoder, info, _ ->
+                val (width, height) = LocalPhotoDecodePolicy.dimensions(info.size.width, info.size.height)
+                decoder.setTargetSize(width, height)
+                decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+                decoder.setTargetColorSpace(android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB))
+            }.asImageBitmap()
         } else {
-            runCatching {
-                context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            }.getOrNull()
-        } ?: return null
-        return runCatching { decodeSampled(bytes)?.asImageBitmap() }.getOrNull()
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            val opts = BitmapFactory.Options().apply {
+                val (targetWidth, targetHeight) = LocalPhotoDecodePolicy.dimensions(bounds.outWidth, bounds.outHeight)
+                var sample = 1
+                while (bounds.outWidth / sample > targetWidth || bounds.outHeight / sample > targetHeight) sample *= 2
+                inSampleSize = sample
+            }
+            context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts)?.asImageBitmap() }
+        }
     }.getOrNull()
+
+    /** ImageDecoder already applies EXIF orientation. Legacy/embedded JPEG decoding does not. */
+    fun previewExifTurns(context: Context, uri: Uri, name: String): Int =
+        if (android.os.Build.VERSION.SDK_INT >= 28 && !name.endsWith(".arw", ignoreCase = true)) 0
+        else exifTurns(context, uri)
 
     /**
      * EXIF 信息行（**顺序即展示顺序**）：文件名 / 文件格式 / 拍摄日期时间 /

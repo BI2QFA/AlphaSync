@@ -50,8 +50,10 @@ import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import io.github.bi2qfa.alphasync.ui.components.ViewportPreviews
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -162,6 +164,7 @@ fun FilesScreen(
     onSwitchDevice: (String) -> Unit = {},
     /** ★ 2.11：双击顶栏标题 → 回列表顶部（MainActivity 递增的信号；0/未变不动）。 */
     topTick: Int = 0,
+    refreshTick: Int = 0,
 ) {
     val context = LocalContext.current
     val host = ConnectionCenter.host
@@ -174,7 +177,8 @@ fun FilesScreen(
     var nextOffset by remember { mutableStateOf(0) }
     var hasMore by remember { mutableStateOf(false) }
     var loadError by remember { mutableStateOf<String?>(null) }
-    var gridView by remember { mutableStateOf(false) }
+    val viewGuid = ConnectionCenter.displayGuid().orEmpty()
+    var gridView by remember(viewGuid) { mutableStateOf(SettingsRepo.filesGridView(viewGuid)) }
     /**
      * 列表排序方向（2.10）：默认 true = 新→旧。
      *
@@ -182,6 +186,10 @@ fun FilesScreen(
      * [displayEntries]。服务端分页方向（reverse 传参）由整合阶段接线，见工具条按钮里的 TODO。
      */
     var sortDesc by remember { mutableStateOf(true) }
+    var fileFormat by remember(viewGuid) {
+        mutableStateOf(FileFormatFilter.entries.firstOrNull { it.name == SettingsRepo.filesFormat(viewGuid) }
+            ?: FileFormatFilter.All)
+    }
 
     // ★ 2.11 §2：列表两端的"在位"状态 —— 自动刷新落地后，只有用户正停在**新文件
     //   出现的那一端**才自动滚动露出（不在两端 = 键锚定天然保位，什么都不做）。
@@ -230,8 +238,8 @@ fun FilesScreen(
      * 这里只是给同一份内容换一个**显示顺序**：默认新→旧（[sortDesc]）；
      * 时间戳相同时按文件名兜底（同一秒连拍也要有确定次序）。
      */
-    val displayEntries: List<ObjectRepository.FtpEntry> = remember(shownEntries, sortDesc) {
-        shownEntries.sortedWith(
+    val displayEntries: List<ObjectRepository.FtpEntry> = remember(shownEntries, sortDesc, fileFormat) {
+        shownEntries.filter { fileFormat.accepts(it.name, it.isDir) }.sortedWith(
             if (sortDesc) {
                 compareByDescending<ObjectRepository.FtpEntry> { it.timestamp }.thenBy { it.name }
             } else {
@@ -270,7 +278,7 @@ fun FilesScreen(
     /**
      * ★ 2.11：与 [fadeDir] 同理 —— 记录"本次淡入属于哪个排序方向"。
      *
-     * <p>点排序会让分支按 `key(dir, guid, sortDesc)` 重建，但 [fadeDir] 只对比目录
+     * <p>点排序会让分支按 `key(dir, guid, sortDesc, fileFormat)` 重建，但 [fadeDir] 只对比目录
      * 名、**看不出排序变了**：重建后的首帧会按上一次动画结束的 alpha=1 把新顺序直接
      * 画出来（下一帧才归零重淡）——正是"闪烁"的味道。把排序方向也纳入对账，
      * 首帧直接按 0 画。
@@ -278,7 +286,7 @@ fun FilesScreen(
     var fadeSort by remember { mutableStateOf<Boolean?>(null) }
 
     // ★ 2.11 §3：`sortDesc` 也作 key —— 点排序那一刻整块列表**重播淡入**（用户定版：
-    //   "只需要刷新列表那个列表闪烁一下的动画"），与下面 key(dir, guid, sortDesc) 的
+    //   "只需要刷新列表那个列表闪烁一下的动画"），与下面 key(dir, guid, sortDesc, fileFormat) 的
     //   分支重建配合，条目不再走"上下颠倒"的位移动画。
     LaunchedEffect(dir, guid, sortDesc, shownEntries.isEmpty()) {
         fadeDir = dir
@@ -332,6 +340,7 @@ fun FilesScreen(
     val queueItems = TransferStore.items
 
     // ★ 第三批（§4）：非选择模式长按 = 弹"下载"确认框（针对该单个文件；文件夹无操作）
+    var showDownloadOptions by remember { mutableStateOf(false) }
     var downloadTarget by remember { mutableStateOf<ObjectRepository.FtpEntry?>(null) }
 
     var preparing by remember { mutableStateOf(false) }
@@ -354,7 +363,7 @@ fun FilesScreen(
 
     /** 目录条目 → 缩略图缓存键（load/loadMore 共用一份，别再各写一遍）。 */
     fun thumbKeysOf(list: List<ObjectRepository.FtpEntry>): List<ThumbStore.ObjectCacheKey> =
-        list.filter { !it.isDir && it.ext in PREVIEWABLE_EXT }.map {
+        list.filter { !it.isDir && it.ext in PREVIEWABLE_EXT && fileFormat.accepts(it.name, false) }.map {
             ThumbStore.ObjectCacheKey(
                     path = it.path,
                 size = it.size,
@@ -418,7 +427,7 @@ fun FilesScreen(
         loadError = null
         try {
             // ① 指纹探测（2.8 起 = 目录条目计数探针，见 [dirFingerprint]）
-            val fp = dirFingerprint(h, d)
+            val fp = if (!force && cached != null) dirFingerprint(h, d) else null
             if (loadEpoch[0] != myEpoch) return false      // 已被更新的 load 取代
             if (!force && cached != null && fp != null && fp == cached.dirStamp && cached.pagedDesc == sortDesc) {
                 // ② 条目数没变 → 缓存即最终结果（列表已在上面铺好），零分页拉取
@@ -428,7 +437,7 @@ fun FilesScreen(
             for (attempt in 0 until LOAD_MAX_ATTEMPTS) {
                 try {
                     val page = withContext(Dispatchers.IO) {
-                        ObjectRepository.listPage(h, d, 0, 256, reverse = sortDesc)
+                        ObjectRepository.listPage(h, d, 0, if (cached == null) 8 else 256, reverse = sortDesc)
                     }
                     if (loadEpoch[0] != myEpoch) return false   // 已被更新的 load 取代：丢弃
                     entries = page.entries
@@ -442,7 +451,7 @@ fun FilesScreen(
                     c.nextOffset = page.nextOffset
                     c.hasMore = page.hasMore
                     // 指纹：本次探测到的条目数；探测不到（根目录/探测失败）用哨兵 = 不可命中
-                    c.dirStamp = fp ?: FileListCache.STAMP_UNKNOWN
+                    c.dirStamp = page.totalCount ?: fp ?: FileListCache.STAMP_UNKNOWN
                     // ★ 2.10：游标随本次的分页方向入缓存（loadMore 与回访都按同方向续翻）
                     c.pagedDesc = sortDesc
                     FileListCache.put(guid, d, c)
@@ -539,7 +548,30 @@ fun FilesScreen(
         }
     }
 
-    LaunchedEffect(dir, host) { load(dir) }
+    // A filtered-out page must not prevent reaching matching files on later pages.
+    LaunchedEffect(dir, fileFormat, loadedDir, shownEntries.size, hasMore, nextOffset, loading) {
+        if (fileFormat != FileFormatFilter.All && loadedDir == dir &&
+            displayEntries.isEmpty() && hasMore && !loading && loadError == null) {
+            loadMore()
+        }
+    }
+    LaunchedEffect(fileFormat, loadedDir) {
+        if (loadedDir == dir) {
+            ThumbStore.request(thumbKeysOf(shownEntries))
+            ThumbStore.ensurePreviews(thumbKeysOf(shownEntries))
+        }
+    }
+
+    LaunchedEffect(dir, guid, loadedDir) {
+        if (guid.isNotBlank() && loadedDir == dir) SettingsRepo.rememberDirectory(guid, dir)
+    }
+    LaunchedEffect(dir, guid, loadedDir, shownEntries, fileFormat) {
+        if (host != null && loadedDir == dir) {
+            ThumbStore.focusDirectory(dir, thumbKeysOf(displayEntries))
+        }
+    }
+
+    LaunchedEffect(dir, host, refreshTick) { load(dir) }
 
     /**
      * ★ 2.8：**停留期间自动刷新**——后台运行时代的旧前提"软件运行时 SD 卡内的
@@ -679,7 +711,11 @@ fun FilesScreen(
      * ★ 第三批（§4）：[targets] = 指定条目名单（非选择模式长按单文件"下载"）——
      * null 时走当前选择集合（原行为不变）；点下载不进入选择模式、不清现有选择。
      */
-    fun startTransfer(targets: List<ObjectRepository.FtpEntry>? = null) {
+    fun startTransfer(
+        targets: List<ObjectRepository.FtpEntry>? = null,
+        priority: Boolean = false,
+        fromPreview: Boolean = false,
+    ) {
         if (preparing || host == null) return
         val activeHost = host
         preparing = true
@@ -702,6 +738,7 @@ fun FilesScreen(
             // ★ 第三批（§4）：targets（长按单文件）优先；否则选择集合（原行为）。
             val entriesSnapshot = targets ?: shownEntries.toList()
             val selectedSnapshot = targets?.map { it.path } ?: selected.toList()
+            val formatSnapshot = if (fromPreview) FileFormatFilter.All else fileFormat
             try {
                 // ★ 网络扫描必须离开主线程：listPage() 是同步阻塞调用（内部在
                 //   ioExecutor 上等结果），选中含子目录的条目时这里会在主线程跑
@@ -713,11 +750,12 @@ fun FilesScreen(
                         host = activeHost,
                         entries = entriesSnapshot,
                         selected = selectedSnapshot,
+                        formatFilter = formatSnapshot,
                         enqueue = { batch ->
                             val items = batch.map {
                                 TransferItem(
                                     id = it.path, name = it.name, path = it.path,
-                                    size = it.size, mtime = it.timestamp,
+                                    size = it.size, mtime = it.timestamp, priorityDownload = priority,
                                 )
                             }
                             // 入队改的是 Compose 状态 → 回到主线程写
@@ -736,9 +774,15 @@ fun FilesScreen(
                 scanProgress = ""
                 if (ConnectionCenter.host != null) {
                     DownloadService.start(context)
-                    selecting = false
-                    selected.clear()
-                    onGoTransfers()
+                    if (fromPreview) {
+                        android.widget.Toast.makeText(context,
+                            if (priority) "已加入优先下载队列" else "已加入下载队列",
+                            android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        selecting = false
+                        selected.clear()
+                        onGoTransfers()
+                    }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // 取消：已经分批入队的任务保留，尚未入队的丢弃。
@@ -903,7 +947,10 @@ fun FilesScreen(
                         )
                     }
                     val viewSource = remember { MutableInteractionSource() }
-                    IconButton(onClick = { gridView = !gridView }, interactionSource = viewSource) {
+                    IconButton(onClick = {
+                        gridView = !gridView
+                        SettingsRepo.rememberFilesDisplay(viewGuid, fileFormat.name, gridView)
+                    }, interactionSource = viewSource) {
                         MsIcon(
                             icon = if (gridView) MsIcon.LIST else MsIcon.GRID,
                             contentDescription = "切换显示模式",
@@ -915,6 +962,25 @@ fun FilesScreen(
                 }
             }
 
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FileFormatFilter.entries.forEach { filter ->
+                    FilterChip(
+                        selected = fileFormat == filter,
+                        onClick = {
+                            if (fileFormat != filter) {
+                                exitSelectMode()
+                                fullscreenEntry = null
+                                fileFormat = filter
+                                SettingsRepo.rememberFilesDisplay(viewGuid, filter.name, gridView)
+                            }
+                        },
+                        label = { Text(filter.label) },
+                    )
+                }
+            }
             // 选中提示条：进/出选择模式时**展开收起**（带弹簧），下面的列表跟着平滑
             // 下移/上移，而不是"啪"地多出一行把内容顶下去
             AnimatedVisibility(
@@ -965,6 +1031,11 @@ fun FilesScreen(
                 HintText("未连接相机，无法浏览文件")
             }
 
+            if (host != null && loadedDir == dir && !loading && !loadingMore &&
+                !hasMore && displayEntries.isEmpty() && loadError == null) {
+                HintText(if (fileFormat == FileFormatFilter.All) "此文件夹为空"
+                    else "此文件夹没有 ${fileFormat.label} 文件")
+            }
             // ★ L4 下拉刷新（用户定版形态）：下拉 → **整块文件列表跟着下移**，顶部
             //   缝隙里露出 M3E 的多边形旋转加载图标（material3 的 LoadingIndicator，
             //   形状 morph + 自转）；松手过阈值 → 图标持续旋转、走强制全量重拉；
@@ -1039,10 +1110,11 @@ fun FilesScreen(
                 // ★ 2.11 §3：sortDesc 也是 key —— 点排序时整个 LazyGrid 重建，
                 //   条目**不走 animateItem 的跨位置弹簧**（那正是用户嫌"上下颠倒"的
                 //   复杂动画）；配合上面 listFade 的淡入重播 = "列表闪一下"。
-                key(dir, guid, sortDesc) {
+                key(dir, guid, sortDesc, fileFormat) {
                 val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState(
                     initialFirstVisibleItemIndex = FileListCache.get(guid, dir)?.gridScroll ?: 0,
                 )
+                ViewportPreviews(displayEntries) { gridState.layoutInfo.visibleItemsInfo.map { it.index } }
                 // 滚动位置持续回写（每个目录一层，互不覆盖 —— "记住每一层级"）；
                 // ★ 2.11 §2：顺带维护"在不在两端"—— 自动露出只在用户停在那端时触发
                 //   （totalItemsCount 是布局状态，列表增减也会让本流重新发射）。
@@ -1085,11 +1157,11 @@ fun FilesScreen(
                 val nearEnd by androidx.compose.runtime.derivedStateOf {
                     // ★ F4：阈值提前到"还剩 6 项"（掩盖网络延迟）；空列表不触发
                     //   （防"空页 + hasMore=true"的异常组合下 loadMore 死循环）
-                    shownEntries.isNotEmpty() &&
+                    displayEntries.isNotEmpty() &&
                         (gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >=
-                        shownEntries.lastIndex - 6
+                        displayEntries.lastIndex - 6
                 }
-                LaunchedEffect(nearEnd, hasMore) {
+                LaunchedEffect(nearEnd, hasMore, nextOffset) {
                     if (nearEnd && hasMore) loadMore()
                 }
                 LazyVerticalGrid(
@@ -1134,12 +1206,13 @@ fun FilesScreen(
                         )
                     }
                 }
-                }   // key(dir, guid, sortDesc)
+                }   // key(dir, guid, sortDesc, fileFormat)
             } else {
-                key(dir, guid, sortDesc) {   // ★ L3 同网格分支（位置字段用 listScroll）；§3 同款 sortDesc 键
+                key(dir, guid, sortDesc, fileFormat) {   // ★ L3 同网格分支（位置字段用 listScroll）；§3 同款 sortDesc 键
                 val listState = androidx.compose.foundation.lazy.rememberLazyListState(
                     initialFirstVisibleItemIndex = FileListCache.get(guid, dir)?.listScroll ?: 0,
                 )
+                ViewportPreviews(displayEntries) { listState.layoutInfo.visibleItemsInfo.map { it.index } }
                 // 滚动位置持续回写（列表模式自己的字段）；★ 2.11 §2 同网格分支维护两端状态
                 LaunchedEffect(dir, guid) {
                     snapshotFlow {
@@ -1178,11 +1251,11 @@ fun FilesScreen(
                 }
                 val nearEnd by androidx.compose.runtime.derivedStateOf {
                     // ★ F4：阈值提前到"还剩 6 项"；空列表不触发（同网格分支的说明）
-                    shownEntries.isNotEmpty() &&
+                    displayEntries.isNotEmpty() &&
                         (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >=
-                        shownEntries.lastIndex - 6
+                        displayEntries.lastIndex - 6
                 }
-                LaunchedEffect(nearEnd, hasMore) {
+                LaunchedEffect(nearEnd, hasMore, nextOffset) {
                     if (nearEnd && hasMore) loadMore()
                 }
                 // ★ 「几个小块拼成一个大块」（用户定版，照已配对相机那一页的样子）：
@@ -1237,7 +1310,7 @@ fun FilesScreen(
                         )
                     }
                 }
-                }   // key(dir, guid, sortDesc)
+                }   // key(dir, guid, sortDesc, fileFormat)
             }
             }   // 位移 Box（下拉跟随）
             }   // PullToRefreshBox
@@ -1278,7 +1351,7 @@ fun FilesScreen(
                         preparing = false
                         scanProgress = ""
                     } else {
-                        startTransfer()
+                        showDownloadOptions = true
                     }
                 }) {
                     if (preparing) {
@@ -1332,27 +1405,38 @@ fun FilesScreen(
                 onDismiss = { fullscreenEntry = null },
                 onOpenSettings = onOpenSettings,
                 onSwitchDevice = onSwitchDevice,
+                onDownload = { photo, priority ->
+                    startTransfer(listOf(photo), priority, fromPreview = true)
+                },
             )
         }
     }
 
     // ★ 第三批（§4）：非选择模式长按文件 → "下载"确认框。点"下载"直接把该条目
     //   点名进扫描队列（targets），不进入选择模式、不清现有选择；文件夹不弹（§10 Q4）。
-    downloadTarget?.let { entry ->
+    if (downloadTarget != null || showDownloadOptions) {
+        fun closeOptions() { downloadTarget = null; showDownloadOptions = false }
         AlertDialog(
-            onDismissRequest = { downloadTarget = null },
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = { Text("下载") },
-            text = { Text("下载 ${entry.name}？") },
-            confirmButton = {
-                TextButton(onClick = {
-                    downloadTarget = null
-                    startTransfer(targets = listOf(entry))
-                }) { Text("下载") }
+            onDismissRequest = { closeOptions() },
+            title = { Text("下载方式") },
+            text = {
+                Column {
+                    Text(downloadTarget?.name ?: "已选择 ${selected.size} 项")
+                    Text("优先下载先于普通任务执行；正常下载按入队顺序执行，并为当前预览让路。")
+                    TextButton(onClick = {
+                        val targets = downloadTarget?.let { listOf(it) }
+                        closeOptions()
+                        startTransfer(targets, priority = true)
+                    }) { Text("优先下载") }
+                    TextButton(onClick = {
+                        val targets = downloadTarget?.let { listOf(it) }
+                        closeOptions()
+                        startTransfer(targets, priority = false)
+                    }) { Text("正常下载") }
+                }
             },
-            dismissButton = {
-                TextButton(onClick = { downloadTarget = null }) { Text("取消") }
-            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { closeOptions() }) { Text("取消") } },
         )
     }
 
@@ -1393,6 +1477,7 @@ private suspend fun collectAndEnqueue(
     host: String,
     entries: List<ObjectRepository.FtpEntry>,
     selected: List<String>,
+    formatFilter: FileFormatFilter,
     /** suspend：调用方要把入队（改 Compose 状态）切回主线程，见 [startTransfer]。 */
     enqueue: suspend (List<ObjectRepository.FtpEntry>) -> Unit,
     onProgress: suspend (Int, Int) -> Unit,
@@ -1414,7 +1499,7 @@ private suspend fun collectAndEnqueue(
     for (path in selected) {
         val selectedEntry = entries.firstOrNull { it.path == path } ?: continue
         if (!selectedEntry.isDir) {
-            if (seen.add(selectedEntry.path)) {
+            if (formatFilter.accepts(selectedEntry.name, false) && seen.add(selectedEntry.path)) {
                 batch.add(selectedEntry)
                 found++
             }
@@ -1440,7 +1525,7 @@ private suspend fun collectAndEnqueue(
                 for (e in page.entries) {
                     if (e.isDir) {
                         if (task.depth < 4) queue.add(DirTask(e.path, task.depth + 1))
-                    } else if (e.ext in PREVIEWABLE_EXT && seen.add(e.path)) {
+                    } else if (e.ext in PREVIEWABLE_EXT && formatFilter.accepts(e.name, false) && seen.add(e.path)) {
                         batch.add(e)
                         found++
                         if (batch.size >= 128) flush()

@@ -8,6 +8,7 @@ import io.github.bi2qfa.alphasync.data.IdentityRepo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -34,25 +35,14 @@ import kotlin.math.min
  *   <li><b>广播补扫</b>：①没命中才发（子网广播 + 受限广播），几百毫秒出结果。</li>
  *   <li><b>整段单播兜底</b>：广播被 AP 过滤时才走 —— 这条很慢，见 scan 的注释。</li>
  * </ol>
- * ★ 端口现在只有一个（用户定版删掉了回退端口），所以"每轮发几个包"是按地址数算、不是
- * 按地址×端口数。历史上是 4 个候选端口一次全打，那条纪律仍然写在 [sendTo] 上 ——
- * 将来若真加回多端口，必须**一次全打**而不是按端口顺序轮流等：顺序轮询会把等待窗口
- * 乘以端口数，而每个包只有几十字节。
+ * 同时探测相机端支持的四个协议端口，避免服务重启后使用备用端口时无法发现。
  */
 object Discovery {
 
     private const val TAG = "Discovery"
 
-    /**
-     * 探测端口：**只有 15740 一个**（与相机端 `PtpIpServer.PROTO_PORT` 一致）。
-     *
-     * <p>原来是 `[15740, 15741, 25740, 25741]` 四个候选一次全打。用户定版删掉回退端口，
-     * 两端一起收成单个 —— 相机端不再往其它端口回退，手机端也就不必再探测它们。
-     *
-     * <p>收益在最慢的那条路上最明显：整段 /24 兜底扫原来是 251×4 = 1004 个包，
-     * 现在是 251 个。常规的已知地址快扫与广播路径本来就只有几个包。
-     */
-    val CANDIDATE_PORTS = intArrayOf(15740)
+    /** 与相机端 PtpIpServer.PROTO_PORT_CANDIDATES 保持一致，一次发送、统一收包。 */
+    val CANDIDATE_PORTS = intArrayOf(15740, 15741, 25740, 25741)
 
     /** 全子网补扫的等待窗口。 */
     private const val SWEEP_TIMEOUT_MS = 420L
@@ -105,95 +95,153 @@ object Discovery {
      *   ⚠ 端口收成 15740 单个之后，这条路的包数降到约四分之一，但**新的耗时没实测过** ——
      *     别把上面那个 9.3 秒当成收窄后的数字引用。
      */
+    /** Each route owns a socket and result map. A slow upstream Wi-Fi cannot delay hotspot discovery. */
     suspend fun scan(
         context: Context,
         boundNetwork: Network? = null,
         preferredHosts: List<String> = emptyList(),
         thorough: Boolean = false,
         sweep: Boolean = true,
-    ): List<DiscoveredCamera> =
-        withContext(Dispatchers.IO) {
-            val (localIp, gateway) = wifiEndpoints(context)
-            val myGuid = IdentityRepo.guid16()
-            val myName = IdentityRepo.friendlyName + " " + PtpCodec.VENDOR_TAG
-            val foundByGuid = LinkedHashMap<String, DiscoveredCamera>()
-            val request = PtpCodec.probe(
-                request = true,
-                guid = myGuid,
-                friendlyName = myName,
-                protoPort = 0,
-                filePort = 0,
-                pairingMode = false,
-                paired = false,
+        targetGuid: String? = null,
+    ): List<DiscoveredCamera> = withContext(Dispatchers.IO) {
+        val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
+        val networks = runCatching {
+            cm?.allNetworks.orEmpty().filter { network ->
+                cm?.getNetworkCapabilities(network)?.hasTransport(
+                    android.net.NetworkCapabilities.TRANSPORT_WIFI,
+                ) == true
+            }
+        }.getOrDefault(emptyList())
+        val wifiNetworks = (listOfNotNull(boundNetwork) + networks).distinct()
+        val visibleBroadcasts = localSubnetBroadcasts()
+        val (localIp, gateway) = wifiEndpoints(context)
+        val request = PtpCodec.probe(
+            request = true,
+            guid = IdentityRepo.guid16(),
+            friendlyName = IdentityRepo.friendlyName + " " + PtpCodec.VENDOR_TAG,
+            protoPort = 0, filePort = 0, pairingMode = false, paired = false,
+        )
+        // System routing reaches hotspot clients; never bind this socket to upstream Wi-Fi.
+        val rawRoute = ScanRoute(
+            network = null,
+            known = (preferredHosts + if (wifiNetworks.isEmpty()) listOfNotNull(gateway, localIp) else emptyList()).distinct(),
+            broadcasts = (preferredHosts.mapNotNull { subnetBroadcastOf(it) } + visibleBroadcasts +
+                tetheringBroadcasts() + "255.255.255.255").distinct(),
+            subnetHosts = (preferredHosts + visibleBroadcasts +
+                if (wifiNetworks.isEmpty()) listOfNotNull(localIp, gateway) else emptyList())
+                .map { subnetOf(it) }.filter { it.isNotEmpty() }.distinct().flatten().distinct(),
+        )
+        val wifiRoutes = wifiNetworks.map { network ->
+            val properties = runCatching { cm?.getLinkProperties(network) }.getOrNull()
+            val addresses = properties?.linkAddresses.orEmpty().filter {
+                it.address is java.net.Inet4Address
+            }
+            val ips = addresses.mapNotNull { it.address.hostAddress }
+            val gateways = properties?.routes.orEmpty().mapNotNull {
+                (it.gateway as? java.net.Inet4Address)?.hostAddress
+            }.filter { it != "0.0.0.0" }
+            ScanRoute(
+                network = network,
+                known = (preferredHosts + gateways + ips).distinct(),
+                broadcasts = (addresses.mapNotNull { link ->
+                    ipv4Broadcast(link.address.hostAddress, link.prefixLength)
+                } + "255.255.255.255").distinct(),
+                subnetHosts = ips.flatMap { subnetOf(it) }.distinct(),
             )
-            val t0 = System.currentTimeMillis()
-            var sweepMs = 0L
+        }
+        val routes = listOf(rawRoute) + wifiRoutes
+        val started = System.currentTimeMillis()
+        val results = scanParallel(routes.map { route ->
+            suspend { scanRoute(route, request, thorough, sweep, targetGuid, if (thorough) emptyList() else preferredHosts) }
+        }, firstMatch = !thorough,
+            repeatingRoutes = if (thorough || preferredHosts.isEmpty()) emptyList() else routes.map { route ->
+                suspend { scanSavedRoute(route.network, preferredHosts, request, targetGuid) }
+            },
+        ).distinctBy { it.guidHex }
+        Log.d(TAG, "并行扫描 ${routes.size} 条路径，命中 ${results.size} 台，耗时 ${System.currentTimeMillis() - started} ms")
+        results
+    }
 
-            DatagramSocket().use { sock ->
-                sock.soTimeout = RECV_SLICE_MS
-                boundNetwork?.let { n -> runCatching { n.bindSocket(sock) } }
+    private data class ScanRoute(
+        val network: Network?,
+        val known: List<String>,
+        val broadcasts: List<String>,
+        val subnetHosts: List<String>,
+    )
 
-                // ① 已知地址快扫（配对表命中 / 网关 / 本机）——绝大多数情况到这就够了
-                val known = LinkedHashSet<String>()
-                preferredHosts.filter { it.isNotBlank() }.forEach { known.add(it) }
-                gateway?.takeIf { it.isNotBlank() }?.let { known.add(it) }
-                localIp?.takeIf { it.isNotBlank() }?.let { known.add(it) }
-                if (known.isNotEmpty()) {
-                    sendTo(sock, known, request)
-                    collect(sock, foundByGuid, FAST_TIMEOUT_MS, stopOnFirst = !thorough)
+    private suspend fun scanRoute(
+        route: ScanRoute,
+        request: ByteArray,
+        thorough: Boolean,
+        sweep: Boolean,
+        targetGuid: String?,
+        savedHosts: List<String>,
+    ): List<DiscoveredCamera> = withContext(Dispatchers.IO) {
+        val found = LinkedHashMap<String, DiscoveredCamera>()
+        try {
+            DatagramSocket().use { socket ->
+                socket.soTimeout = RECV_SLICE_MS
+                socket.broadcast = true
+                // Failure to bind must not silently scan the wrong network.
+                route.network?.bindSocket(socket)
+                // Saved addresses are probed separately; this worker handles LAN discovery.
+                // Each LAN path receives between batches and retains its own socket.
+                sendTo(socket, route.known.filterNot { it in savedHosts }, request)
+                collect(socket, found, FAST_TIMEOUT_MS, stopOnFirst = !thorough, targetGuid = targetGuid)
+                if (thorough || found.isEmpty()) {
+                    sendTo(socket, route.broadcasts, request)
+                    collect(socket, found, FAST_TIMEOUT_MS, stopOnFirst = !thorough, targetGuid = targetGuid)
                 }
-
-                // ② 广播补扫（**先试它**）——相机绑的是通配地址，广播探测它收得到：
-                //   一次广播 = 两个小包、几百毫秒就有结果；而整段单播扫是 251 个包
-                //   （端口收窄前是 1004 个、实测 9.3 秒；收窄后未实测），发送本身阻塞。
-                // ★ 扫描修复（10-01，用户实测）：**thorough（手动扫描）时无论快扫有没有命中
-                //   都要广播** —— 原实现只要快扫命中一台（典型：配对表里那台已配对的相机
-                //   正开着配对窗口）就跳过广播，于是同网段**第二台待配对的设备永远看不见**
-                //   （用户反馈"多个配对模式的设备只能扫描到一个"）。广播是发现陌生设备
-                //   的唯一途径，不能被"已知那台已命中"短路。自动扫描（thorough=false）
-                //   保持快路径不变：命中一台就走，不等广播。
-                if (sweep && (thorough || foundByGuid.isEmpty())) {
-                    val s0 = System.currentTimeMillis()
-                    sendBroadcast(sock, localIp ?: gateway, request)
-                    // ★ 再打两遍"热点/多网卡"的广播（见 [tetheringBroadcasts] 的说明）：
-                    //   一遍用当前 socket（可能绑着 Wi-Fi 网络），一遍用**未绑定**的
-                    //   socket —— 手机做热点时，绑了网络的 socket 发不出/收不回走热点的包。
-                    val extra = (tetheringBroadcasts() + localSubnetBroadcasts()).distinct()
-                    if (extra.isNotEmpty()) {
-                        sendTo(sock, extra, request)
-                        DatagramSocket().use { raw ->
-                            raw.soTimeout = RECV_SLICE_MS
-                            sendTo(raw, extra, request)
-                            collect(raw, foundByGuid, FAST_TIMEOUT_MS, stopOnFirst = false)
-                        }
+                if (sweep && (thorough || found.isEmpty())) {
+                    probeInBatches(socket, route.subnetHosts.filterNot { it in route.known }, request) {
+                        collect(socket, found, 50L, stopOnFirst = !thorough, targetGuid = targetGuid)
+                        !thorough && found.isNotEmpty()
                     }
-                    collect(sock, foundByGuid, SWEEP_TIMEOUT_MS, stopOnFirst = false)
-                    sweepMs = System.currentTimeMillis() - s0
-                }
-
-                // ③ 整段单播扫：兜底广播被 AP 过滤的情况（有些 AP 会过滤广播），
-                //   那条路慢但能通。
-                // ★ 扫描修复（10-01）：thorough 时同样不早退 —— 这正是 [scan] 文档里
-                //   "不做早退、老老实实扫完整个子网"的承诺：不在配对表里、广播又被
-                //   过滤掉的设备，只能靠这一遍逐地址单播找到。
-                if (sweep && foundByGuid.isEmpty()) {
-                    val rest = subnetOf(localIp ?: gateway).filterNot { known.contains(it) }
-                    if (rest.isNotEmpty()) {
-                        val s1 = System.currentTimeMillis()
-                        sendTo(sock, rest, request)
-                        collect(sock, foundByGuid, SWEEP_TIMEOUT_MS, stopOnFirst = false)
-                        sweepMs += System.currentTimeMillis() - s1
+                    if (thorough || found.isEmpty()) {
+                        collect(socket, found, SWEEP_TIMEOUT_MS, stopOnFirst = !thorough, targetGuid = targetGuid)
                     }
                 }
             }
-            Log.d(
-                TAG,
-                "扫描完成：已知 ${preferredHosts.size} 条，命中 ${foundByGuid.size} 台，" +
-                    "thorough=$thorough sweep=$sweep，耗时 ${System.currentTimeMillis() - t0} ms" +
-                    if (sweepMs > 0) "（补扫占 $sweepMs ms）" else "",
-            )
-            foundByGuid.values.sortedByDescending { it.pairingMode }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Log.d(TAG, "扫描路径 ${route.network ?: "热点/系统路由"} 失败：${failure.message}")
         }
+        found.values.toList()
+    }
+
+    /** A saved-IP probe has its own socket, independent of long subnet sweeps. */
+    private suspend fun scanSavedRoute(
+        network: Network?,
+        hosts: List<String>,
+        request: ByteArray,
+        targetGuid: String?,
+    ): List<DiscoveredCamera> = withContext(Dispatchers.IO) {
+        val found = LinkedHashMap<String, DiscoveredCamera>()
+        try {
+            DatagramSocket().use { socket ->
+                socket.soTimeout = RECV_SLICE_MS
+                network?.bindSocket(socket)
+                sendTo(socket, hosts, request)
+                collect(socket, found, FAST_TIMEOUT_MS, stopOnFirst = true, targetGuid = targetGuid)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Log.d(TAG, "保存地址探测失败：${failure.message}")
+        }
+        found.values.toList()
+    }
+
+    internal fun ipv4Broadcast(host: String?, prefix: Int): String? {
+        if (host == null || prefix !in 1..30) return null
+        val octets = host.split('.').map { it.toIntOrNull() ?: return null }
+        if (octets.size != 4 || octets.any { it !in 0..255 }) return null
+        val address = octets.fold(0L) { value, octet -> (value shl 8) or octet.toLong() }
+        val mask = (0xffffffffL shl (32 - prefix)) and 0xffffffffL
+        val broadcast = address or (mask.inv() and 0xffffffffL)
+        return listOf(24, 16, 8, 0).joinToString(".") { ((broadcast shr it) and 255).toString() }
+    }
 
     /**
      * 往这些主机各发一个探测包。
@@ -202,13 +250,28 @@ object Discovery {
      * 这里天然支持"一次全发、只等一个窗口"，不用改结构。**别改成按端口顺序轮流等** ——
      * 那会把等待窗口乘以端口数。
      */
-    private fun sendTo(sock: DatagramSocket, hosts: Collection<String>, request: ByteArray) {
+    internal fun CoroutineScope.sendTo(sock: DatagramSocket, hosts: Collection<String>, request: ByteArray) {
         for (h in hosts) {
             for (port in CANDIDATE_PORTS) {
+                ensureActive()
                 runCatching {
                     sock.send(DatagramPacket(request, request.size, InetSocketAddress(h, port)))
                 }
             }
+        }
+    }
+
+    /** Drain responses between small batches instead of sending an entire /24 before reading. */
+    internal suspend fun CoroutineScope.probeInBatches(
+        sock: DatagramSocket,
+        hosts: Collection<String>,
+        request: ByteArray,
+        receivedTarget: suspend () -> Boolean,
+    ) {
+        for (batch in hosts.toList().chunked(8)) {
+            ensureActive()
+            sendTo(sock, batch, request)
+            if (receivedTarget()) return
         }
     }
 
@@ -220,7 +283,7 @@ object Discovery {
      *   那一条在这台手机上要 9.3 秒，且是纯等待。广播这一轮几百毫秒。
      *   ⚠ 广播可能被 AP 过滤，所以调用方**保留单播扫作兜底**（见 scan 的 ③）。
      */
-    private fun sendBroadcast(sock: DatagramSocket, ip: String?, request: ByteArray) {
+    private fun CoroutineScope.sendBroadcast(sock: DatagramSocket, ip: String?, request: ByteArray) {
         runCatching { sock.broadcast = true }
         val targets = LinkedHashSet<String>()
         subnetBroadcastOf(ip)?.let { targets.add(it) }
@@ -247,6 +310,7 @@ object Discovery {
         foundByGuid: MutableMap<String, DiscoveredCamera>,
         windowMs: Long,
         stopOnFirst: Boolean,
+        targetGuid: String? = null,
     ) {
         val deadline = System.currentTimeMillis() + windowMs
         var lastHit = 0L
@@ -267,6 +331,7 @@ object Discovery {
             }
             val raw = pkt.data.copyOfRange(pkt.offset, pkt.offset + pkt.length)
             val cam = parse(raw, pkt.address?.hostAddress ?: continue) ?: continue
+            if (targetGuid != null && cam.guidHex != targetGuid) continue
             foundByGuid[cam.guidHex] = cam
             lastHit = System.currentTimeMillis()
             if (stopOnFirst) return

@@ -225,6 +225,16 @@ object TransferStore {
      *   条目一旦落进 A 的桶，"文件该进 A 的目录"这件事就定了，之后不管用户切到哪台
      *   相机、不管下载发生在什么时候，都不再重新推导（现算必然出事，见 StorageSink 注释）。
      */
+    fun nextQueued(q: DeviceQueue): TransferItem? = synchronized(lock) { DownloadOrder.next(q.items.toList()) }
+
+    fun shouldPreempt(q: DeviceQueue, item: TransferItem): Boolean = synchronized(lock) {
+        DownloadOrder.shouldPreempt(q.items.firstOrNull { it.id == item.id } ?: item, q.items.toList())
+    }
+
+    fun isPriority(q: DeviceQueue, id: String): Boolean = synchronized(lock) {
+        q.items.firstOrNull { it.id == id }?.priorityDownload == true
+    }
+
     fun enqueue(q: DeviceQueue, item: TransferItem) {
         enqueueBatch(q, listOf(item), persistOnce = true)
     }
@@ -241,6 +251,7 @@ object TransferStore {
             for ((i, old) in q.items.withIndex()) index[old.id] = i
             var changed = false
             val fresh = ArrayList<TransferItem>(newItems.size)
+            val requeued = HashSet<String>()
             val freshIndex = HashMap<String, Int>(newItems.size)
             for (raw in newItems) {
                 val item = raw
@@ -267,14 +278,15 @@ object TransferStore {
                     ex.size != stamped.size ||
                     ex.mtime != stamped.mtime
                 if (ex.state == TransferState.QUEUED || ex.state == TransferState.RUNNING) {
-                    if (identityChanged) {
+                    if (identityChanged || (stamped.priorityDownload && !ex.priorityDownload)) {
                         q.items[idx] = ex.copy(
                             name = stamped.name,
                             path = stamped.path,
                             size = stamped.size,
                             mtime = stamped.mtime,
                             deviceDir = stamped.deviceDir.ifBlank { ex.deviceDir },
-                            doneBytes = 0L,
+                            doneBytes = if (identityChanged) 0L else ex.doneBytes,
+                            priorityDownload = ex.priorityDownload || stamped.priorityDownload,
                         )
                         changed = true
                     }
@@ -287,14 +299,21 @@ object TransferStore {
                     mtime = stamped.mtime,
                     deviceDir = stamped.deviceDir.ifBlank { ex.deviceDir },
                     state = TransferState.QUEUED,
+                    priorityDownload = stamped.priorityDownload,
                     doneBytes = if (identityChanged || ex.state == TransferState.DONE) 0L
                     else ex.doneBytes.coerceIn(0, stamped.size),
                 )
+                requeued.add(ex.id)
                 changed = true
             }
+            if (requeued.isNotEmpty()) {
+                val tail = q.items.filter { it.id in requeued }
+                q.items.removeAll { it.id in requeued }
+                q.items.addAll(tail)
+            }
             if (fresh.isNotEmpty()) {
-                // 保持“新任务在上”的历史顺序。
-                for (item in fresh.asReversed()) q.items.add(0, item)
+                // Normal tasks keep arrival order; priority is selected independently.
+                q.items.addAll(fresh)
             }
             if (changed && persistOnce) persist(q)
         }
@@ -395,7 +414,7 @@ object TransferStore {
         synchronized(lock) {   // ★ 审修复（H4）：见 [lock] 注释
             val idx = q.items.indexOfFirst { it.id == item.id }
             if (idx >= 0) {
-                q.items[idx] = item
+                q.items[idx] = item.copy(priorityDownload = item.priorityDownload || q.items[idx].priorityDownload)
                 persist(q)
             }
         }

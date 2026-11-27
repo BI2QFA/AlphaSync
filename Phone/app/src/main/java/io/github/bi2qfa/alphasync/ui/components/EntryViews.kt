@@ -33,6 +33,8 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -230,6 +232,17 @@ internal fun GridCell(
                             contentAlignment = Alignment.Center,
                         ) {
                             CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                        }
+                        isImage && st == ThumbStore.ThumbState.FAILED -> Box(
+                            Modifier.fillMaxWidth().aspectRatio(1.5f),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("预览失败", color = MaterialTheme.colorScheme.error)
+                                TextButton(onClick = { cacheKey?.let(ThumbStore::retryPreview) }) {
+                                    Text("重试")
+                                }
+                            }
                         }
                         else -> GridPlaceholder(
                             // 文件夹 / 无缩略图的图片 / 其它文件 —— 三种字形，只画图标
@@ -453,6 +466,11 @@ internal fun ThumbOrPlaceholder(entry: ObjectRepository.FtpEntry, size: Int) {
             // ★ 正在加载：历史口径 20dp / strokeWidth 2dp（2.6 原位实现）
             isImage && st == ThumbStore.ThumbState.LOADING ->
                 CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+            isImage && st == ThumbStore.ThumbState.FAILED ->
+                TextButton(
+                    onClick = { cacheKey?.let(ThumbStore::retryPreview) },
+                    contentPadding = PaddingValues(0.dp),
+                ) { Text("重试", style = MaterialTheme.typography.labelSmall) }
             // ★ 与网格同一条规矩：文件夹 / 非图片文件 / 未加载图片都只画**一枚图标**
             else -> MsIcon(
                 icon = when {

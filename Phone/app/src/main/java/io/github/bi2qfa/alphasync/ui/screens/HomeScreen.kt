@@ -216,15 +216,36 @@ fun HomeScreen(onOpenCameraDetail: () -> Unit) {
             }
         }
 
+        GroupCard {
+            val resource = if (connected) DeviceStore.resources else null
+            Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("相机资源", style = MaterialTheme.typography.titleMedium)
+                if (resource == null) {
+                    Text(if (connected) "相机端暂未提供资源数据" else "未连接",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    Text("系统 CPU：${resource.cpuText(resource.systemCpu10)}")
+                    Text("系统内存${if (resource.memoryEstimated) "（估算）" else ""}：${resource.memoryText()}")
+                    Text("AlphaSync CPU：${resource.cpuText(resource.appCpu10)}")
+                    Text("AlphaSync 内存（RSS）：${resource.bytesText(resource.appRss)}")
+                    Text("Java 堆：${resource.bytesText(resource.heapUsed)} / ${resource.bytesText(resource.heapMax)}")
+                    Text("随心跳约每 3 秒刷新；CPU 按全部核心总算力计算",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+
         // ===== 连接 =====
         // ★ 第四批（项2）：相机端后台声明的"重连窗口"（awaitingReconnect）——
         //   收到声明立刻置位，主界面随即显示"正在连接 + 等待重新连接"，不等心跳判活：
         //   网络重启那段时间确实断过，继续写"已连接"是欺瞒用户。
         val awaiting = ConnectionCenter.awaitingReconnect
-        val waiting = connecting || awaiting
+        val waiting = connecting || awaiting || (!connected && ConnectionCenter.autoReconnecting)
         // 未连接的原因（心跳失联 / 相机端退出 / 未找到设备）—— 没这行用户只能猜；
         // "等待重连"窗口里由 awaiting 的专用文案承担，不再叠 lastError 行。
-        val error = if (!connected && !waiting) ConnectionCenter.lastError else null
+        val error = if (!connected) ConnectionCenter.lastError else null
         // ★ 2.11 §9：边拍边传开关行已删（搬去文件页旁的"同步页"）——
         //   段数 = 状态行 +（有错时）错误行 + 按钮行。
         val errorIndex = 1
@@ -249,11 +270,12 @@ fun HomeScreen(onOpenCameraDetail: () -> Unit) {
                     }
                     // ★ 第四批（项2）：相机端进后台后的重连窗口——立刻显示用户定版文案
                     //   （"正在连接" + 这句话，一个都不少）。
-                    awaiting -> ConnectionCenter.BACKGROUND_NOTICE
-                    // 普通连接中不再写副标题（用户定版：只保留"正在连接"四个字）。
+                    awaiting -> ConnectionCenter.connectionProgress.takeIf { it.isNotBlank() } ?: "等待相机上线，将自动重新连接"
+                        ?: ConnectionCenter.BACKGROUND_NOTICE
+                    // 连接期间显示搜索阶段与目标地址，便于定位重连失败。
                     // 未连接时这句说明**该去查什么**（用户定版文案）：不说清原因，
                     // 用户只会反复点重连。
-                    waiting -> null
+                    waiting -> ConnectionCenter.connectionProgress.takeIf { it.isNotBlank() } ?: "等待相机上线，将自动重新连接"
                     else -> "确保相机服务正常运行"
                 },
                 // 说明文字单行省略（用户反馈：Wi-Fi 名过长时折行，圆片与文字就不对齐了）

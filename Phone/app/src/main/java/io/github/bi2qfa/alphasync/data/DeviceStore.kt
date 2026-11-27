@@ -14,6 +14,9 @@ import androidx.compose.runtime.mutableStateOf
  */
 object DeviceStore {
 
+    var resources by mutableStateOf<CameraResources?>(null)
+        private set
+
     var info by mutableStateOf<CameraInfo?>(null)
         private set
 
@@ -38,10 +41,12 @@ object DeviceStore {
      */
     fun apply(i: CameraInfo?) {
         if (i == null) {
+            resources = null
             info = null
             return
         }
         val cur = info
+        if (cur != null && !cur.guid.equals(i.guid, ignoreCase = true)) resources = null
         info = if (cur == null || !cur.guid.equals(i.guid, ignoreCase = true)) {
             i
         } else {
@@ -66,13 +71,15 @@ object DeviceStore {
      * 由 3s 心跳 `OP_PING` 驱动；无变化时不动 state（避免无谓重组）。
      * ★ 2.11：SD 容量（总/已用）也随本心跳进来（实时口径）；未知（<0）不覆盖。
      */
-    fun applyPing(batteryPct: Int, lens: String, sdTotal: Long = -1L, sdUsed: Long = -1L) {
+    fun applyPing(batteryPct: Int, lens: String, sdTotal: Long = -1L, sdUsed: Long = -1L, resourceInfo: CameraResources? = null) {
+        resources = resourceInfo
         val cur = info ?: return
         val next = cur.applyPing(batteryPct, lens, sdTotal, sdUsed)
         if (next != cur) info = next
     }
 
     fun clear() {
+        resources = null
         info = null
     }
 }

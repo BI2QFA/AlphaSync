@@ -70,7 +70,9 @@ object PhotoRotate {
      * 一次性把 [turns] 个 90° 转好（装载首帧用：回到一张之前转过的图时，
      * 要**瞬时**呈现它的朝向，而不是当着用户的面转几圈）。
      */
+    internal fun rotationDegrees(turns: Int): Float = STEP_DEG * (turns % 4)
+
     fun rotateSteps(src: ImageBitmap, turns: Int): ImageBitmap =
-        if (turns <= 0) src else rotate(src, STEP_DEG * turns)
+        if (rotationDegrees(turns) == 0f) src else rotate(src, rotationDegrees(turns))
 
 }

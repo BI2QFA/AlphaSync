@@ -27,7 +27,7 @@ import java.util.Map;
  * 路径转成相对形态后再碰 prefetcher，两处必须始终一致，否则缩略图会
  * **静默全部 miss**（功能看不出来坏，只是永远走实时提取）。
  */
-public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.PairingHandler {
+public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.PairingHandler, PtpIpServer.ResourceHandler {
 
     /** 平台能力注入点；由 MainActivity 实现（内部用 Context 调 DeviceInfo）。 */
     public interface Platform {
@@ -70,6 +70,9 @@ public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.Pairin
         long sdUsedBytes();
     }
 
+    private final ResourceStats resourceStats = new ResourceStats();
+    public void appendResourceStats(StringBuilder json) { resourceStats.append(json); }
+
     private final File rootDir;
     private final ThumbPrefetcher prefetcher;
     private final PairingStore pairing;
@@ -99,6 +102,9 @@ public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.Pairin
      * ★ 键必须**同时**区分路径与 kind（历史 bug 根因：只按路径记会把小图当大图发出去）。
      */
     private static final int MEMO_ENTRIES = 8;
+    private static final long MEMO_TOTAL_BYTES = Runtime.getRuntime().maxMemory() <= 32L * 1024 * 1024
+            ? 1024L * 1024 : 4L * 1024 * 1024;
+    private long memoBytes;
 
     private final Object memoLock = new Object();
 
@@ -106,9 +112,22 @@ public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.Pairin
     private final LinkedHashMap<String, byte[]> memo =
             new LinkedHashMap<String, byte[]>(8, 0.75f, true) {
                 protected boolean removeEldestEntry(Map.Entry<String, byte[]> eldest) {
-                    return size() > MEMO_ENTRIES;
+                    return false; // Explicit eviction keeps the byte total accurate.
                 }
             };
+
+    private void cacheMemoLocked(String key, byte[] bytes) {
+        byte[] old = memo.remove(key);
+        if (old != null) memoBytes -= old.length;
+        if (bytes.length > MEMO_TOTAL_BYTES) return;
+        java.util.Iterator<Map.Entry<String, byte[]>> it = memo.entrySet().iterator();
+        while (it.hasNext() && (memoBytes + bytes.length > MEMO_TOTAL_BYTES || memo.size() >= MEMO_ENTRIES)) {
+            memoBytes -= it.next().getValue().length;
+            it.remove();
+        }
+        memo.put(key, bytes);
+        memoBytes += bytes.length;
+    }
 
     public PtpCameraHandler(File rootDir,
                             ThumbPrefetcher prefetcher,
@@ -251,7 +270,7 @@ public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.Pairin
      * 窗口开着但未配对的情况由配对阶段接管，这里不必也不该放行。
      */
     public boolean allowInitiator(byte[] guid8) {
-        return pairing != null && pairing.contains(guid8);
+        return PtpIpServer.DIRECT_CONNECT || (pairing != null && pairing.contains(guid8));
     }
 
     /**
@@ -547,6 +566,7 @@ public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.Pairin
         sb.append(SJson.str("dir")).append(':').append(SJson.str(path));
         sb.append(',').append(SJson.str("offset")).append(':').append(reportedOffset);
         sb.append(',').append(SJson.str("nextOffset")).append(':').append(nextOffset);
+        sb.append(',').append(SJson.str("totalCount")).append(':').append(files.length);
         sb.append(',').append(SJson.str("hasMore")).append(':').append(hasMore ? "true" : "false");
         sb.append(',').append(SJson.str("entries")).append(":[");
         int n = 0;
@@ -657,6 +677,9 @@ public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.Pairin
         p.pairedAt = now();
         p.lastSeenAt = now();
         pairing.upsert(p);
+        if (pairing.lastError() != null) {
+            throw new IllegalStateException("配对记录未持久保存: " + pairing.lastError());
+        }
         pairing.closeWindow();
         PairingEvents pe = pairingEvents;
         if (pe != null) {
@@ -896,7 +919,7 @@ public class PtpCameraHandler implements PtpIpServer.Handler, PtpIpServer.Pairin
         }
         if (out != null && out.length <= MEMO_MAX_BYTES) {
             synchronized (memoLock) {
-                memo.put(key, out);
+                cacheMemoLocked(key, out);
             }
         }
         return out;

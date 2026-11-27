@@ -65,7 +65,7 @@ class PtpIpClient(
      * ★ 2.11：SD 容量（总/已用字节）也并进本包（实时口径，边拍边填/换卡要立刻反映）；
      * 未知 = -1，合并端见负不覆盖已显示值。
      */
-    class PingInfo(val batteryPct: Int, val lens: String, val sdTotal: Long, val sdUsed: Long)
+    class PingInfo(val batteryPct: Int, val lens: String, val sdTotal: Long, val sdUsed: Long, val resources: io.github.bi2qfa.alphasync.data.CameraResources? = null)
 
     class StatInfo(val size: Long, val mtime: Long)
 
@@ -90,6 +90,8 @@ class PtpIpClient(
     private val txCounter = AtomicInteger(0)
     private val pending = ConcurrentHashMap<Int, ArrayBlockingQueue<OpResult>>()
     private val closed = AtomicBoolean(false)
+    @Volatile private var lastResponseNanos = System.nanoTime()
+    fun responseAgeMs(): Long = (System.nanoTime() - lastResponseNanos) / 1_000_000
 
     @Volatile
     private var eventListener: EventListener? = null
@@ -256,6 +258,7 @@ class PtpIpClient(
     // ============================================================
 
     private fun onControlMessage(m: PtpCodec.Msg) {
+        lastResponseNanos = System.nanoTime()
         when (m.type) {
             PtpCodec.T_OPERATION_RSP -> {
                 val res = try {
@@ -352,15 +355,22 @@ class PtpIpClient(
         var lens = ""
         var sdT = -1L
         var sdU = -1L
+        var resources: io.github.bi2qfa.alphasync.data.CameraResources? = null
         try {
             val o = org.json.JSONObject(raw)
             lens = o.optString("lens", "")
             sdT = o.optLong("sdT", -1L)
             sdU = o.optLong("sdU", -1L)
+            if (o.optInt("resV", 0) == 1) resources = io.github.bi2qfa.alphasync.data.CameraResources(
+                o.optInt("cpuSystem10", -1), o.optInt("cpuApp10", -1),
+                o.optLong("memTotal", -1), o.optLong("memUsed", -1),
+                o.optBoolean("memEstimated", false), o.optLong("appRss", -1),
+                o.optLong("heapUsed", -1), o.optLong("heapMax", -1),
+            )
         } catch (e: Exception) {
             android.util.Log.w("PtpIpClient", "PING blob 不是 JSON，按未知处理：" + raw.take(60))
         }
-        return PingInfo(bat, lens, sdT, sdU)
+        return PingInfo(bat, lens, sdT, sdU, resources)
     }
 
     /** 解除配对：请相机删掉本机那条配对记录（已认证会话内执行）。 */

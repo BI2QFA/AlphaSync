@@ -1,5 +1,12 @@
 package io.github.bi2qfa.alphasync.ui.screens
 
+import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.padding
+import io.github.bi2qfa.alphasync.ui.components.LightRatioLayer
+import io.github.bi2qfa.alphasync.ui.components.LightRatioReadout
+import io.github.bi2qfa.alphasync.ui.components.LightRatioState
+import io.github.bi2qfa.alphasync.ui.components.LightRatioToggle
+
 import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -90,6 +97,8 @@ fun LocalPhotoViewer(
     var infoOpen by remember { mutableStateOf(false) }
     // 当前这一张（顶部文案、EXIF 弹窗、底部按钮都用它）
     val current = items.getOrNull(pagerState.currentPage)
+    var lightRatioEnabled by remember { mutableStateOf(false) }
+    val lightRatio = remember(current?.id) { LightRatioState() }
 
     // 旋转：点了几次（每张各自记）/ 已转完几段（页面回报）——与文件页大预览同一套限流
     // （排队深度 ≤ 2：正在播的那段 + 至多一段待播）。
@@ -121,6 +130,7 @@ fun LocalPhotoViewer(
                     onOffset = { if (page == pagerState.currentPage) offset = it },
                     turnsOf = { rotationByPath[item.path] ?: 0 },
                     onBaked = { n -> bakedByPath[item.path] = n },
+                    lightRatio = lightRatio.takeIf { lightRatioEnabled && page == pagerState.currentPage },
                 )
             }
         }
@@ -144,7 +154,14 @@ fun LocalPhotoViewer(
                 if (date.isNotBlank()) "$date · $seq" else seq
             },
             onBack = onDismiss,
+            actions = {
+                LightRatioToggle(lightRatioEnabled) {
+                    lightRatioEnabled = !lightRatioEnabled
+                    lightRatio.reset()
+                }
+            },
         )
+        if (lightRatioEnabled) LightRatioReadout(lightRatio, Modifier.padding(horizontal = 20.dp))
         }
 
         // ===== 底部：与主界面同一套悬浮导航（药丸两个动作 + 小球/控制中心面板）=====
@@ -186,6 +203,7 @@ private fun LocalPhotoPage(
     onOffset: (Offset) -> Unit,
     turnsOf: () -> Int = { 0 },
     onBaked: (Int) -> Unit = {},
+    lightRatio: LightRatioState?,
 ) {
     val context = LocalContext.current
     var bmp by remember(uri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
@@ -207,7 +225,7 @@ private fun LocalPhotoPage(
         //   传感器横向、方向全在标签里——与列表缩略图同一转法），再把已点过的旋转
         //   **瞬时**补上（不播动画）；状态落定后才赋 bmp（旋转协程靠"bmp 从无到有"唤醒）。
         //   手动旋转仍叠加在 EXIF 之上：baked / 限流只计**用户段**，EXIF 段不占额度。
-        val exifTurns = withContext(Dispatchers.IO) { LocalPhoto.exifTurns(context, uri) }
+        val exifTurns = withContext(Dispatchers.IO) { LocalPhoto.previewExifTurns(context, uri, item.name) }
         val already = turnsOf()
         val loaded = PhotoRotate.rotateSteps(b, exifTurns + already)
         baked = already
@@ -254,7 +272,8 @@ private fun LocalPhotoPage(
         Modifier
             .fillMaxSize()
             .onSizeChanged { boxSize = it }
-            .pointerInput(Unit) {
+            .pointerInput(lightRatio == null) {
+                if (lightRatio != null) return@pointerInput
                 detectTapGestures(
                     onDoubleTap = {
                         if (currentScale > 1.001f) {
@@ -285,12 +304,13 @@ private fun LocalPhotoPage(
             failed -> Text("无法读取文件", color = MaterialTheme.colorScheme.error)
             else -> CircularProgressIndicator(color = Color.White)
         }
+        if (b != null && lightRatio != null && anim.value == 0f) LightRatioLayer(b, lightRatio)
     }
 }
 
 /**
  * 照片信息弹窗（用户定版的行与顺序）：
- * 文件名 / 文件格式 / 拍摄日期时间 / 相机型号 / 镜头型号 / 焦距 / 光圈 / 快门速度 / EV / ISO。
+ * 文件名 / 文件格式 / 文件大小 / 拍摄日期时间 / 相机型号 / 镜头型号 / 焦距 / 光圈 / 快门速度 / EV / ISO。
  *
  * ★ 2.7.0：版式搬到共享组件 [ExifInfoDialog]（文件页相机预览也用它，两处必须一致）；
  *   本函数只负责"本地文件 → 行"的数据源。
@@ -298,17 +318,22 @@ private fun LocalPhotoPage(
 @Composable
 private fun LocalExifDialog(item: TransferItem, uri: Uri?, onDismiss: () -> Unit) {
     val context = LocalContext.current
+    val knownSize = item.size.takeIf { it > 0 }
+    var fileSize by remember(uri, knownSize) { mutableStateOf(knownSize) }
     var rows by remember(uri, item.id) {
         mutableStateOf<List<Pair<String, String>>>(emptyList())
     }
-    LaunchedEffect(uri, item.id) {
+    LaunchedEffect(uri, item.id, knownSize) {
+        if (uri != null && knownSize == null) {
+            fileSize = withContext(Dispatchers.IO) { LocalPhoto.fileSize(context, uri) }
+        }
         rows = withContext(Dispatchers.IO) {
             if (uri == null) listOf("文件名" to item.name, "文件格式" to
                 item.name.substringAfterLast('.', "").uppercase())
             else LocalPhoto.readExif(context, uri, item.name)
         }
     }
-    ExifInfoDialog(rows = rows, onDismiss = onDismiss)
+    ExifInfoDialog(rows = rows, fileSize = fileSize, onDismiss = onDismiss)
 }
 
 /** 传输时间（与传输页列表同一口径：`yyyy-MM-dd HH:mm`）；0 = 不知道则空串。 */

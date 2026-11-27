@@ -75,7 +75,7 @@ import io.github.bi2qfa.alphasync.ui.components.ConnectedButtonGroup
  */
 enum class SettingsPage(val title: String) {
     Hub("设置"),
-    Cameras("已配对相机"),
+    Cameras("已连接过的相机"),
     Files("文件保存位置"),
     Storage("缓存"),
     Appearance("外观"),
@@ -131,7 +131,7 @@ private fun SettingsHub(onNavigate: (SettingsPage) -> Unit) {
         SettingsRow(
             index = 0, count = 1,
             title = "相机",
-            support = "已配对相机、配对新相机",
+            support = "已连接过的相机、连接新相机",
             leading = { IconCircle(MsIcon.CAMERA, IconTints.Accent) },
             trailing = { Chevron() },
             onClick = { onNavigate(SettingsPage.Cameras) },
@@ -178,7 +178,7 @@ private fun SettingsHub(onNavigate: (SettingsPage) -> Unit) {
     }
 }
 
-/** 二级页：已配对相机（解除配对 / 切设备 / 配新的）。 */
+/** 二级页：已连接过的相机（解除配对 / 切设备 / 配新的）。 */
 @Composable
 private fun CamerasPage(onOpenPairing: () -> Unit) {
     val context = LocalContext.current
@@ -191,11 +191,11 @@ private fun CamerasPage(onOpenPairing: () -> Unit) {
         AlertDialog(
             onDismissRequest = { pendingUnpair = null },
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            title = { Text("解除配对？") },
+            title = { Text("移除相机记录？") },
             text = {
                 Text(
-                    // 用户定版：只说"解除配对"，不再解释重连要重新取码
-                    "将解除与「${if (cam != null) labelOf(cam) else id}」的配对。",
+                    // 用户定版：只说"移除记录"，不再解释重连要重新取码
+                    "将移除与「${if (cam != null) labelOf(cam) else id}」的连接记录。",
                 )
             },
             confirmButton = {
@@ -216,8 +216,8 @@ private fun CamerasPage(onOpenPairing: () -> Unit) {
         SettingsGroup {
             SettingsRow(
                 index = 0, count = 1,
-                title = "尚无已配对相机",
-                support = "在相机上进入配对模式",
+                title = "尚无已连接过的相机",
+                support = "确保相机端软件正常运行",
                 leading = { IconCircle(MsIcon.CAMERA, IconTints.Accent) },
             )
         }
@@ -280,7 +280,7 @@ private fun CamerasPage(onOpenPairing: () -> Unit) {
                             val code = ConnectionCenter.shortCode(cam.peerDeviceId)
                             if (code.isNotEmpty()) {
                                 Text(
-                                    "设备码 $code",
+                                    "${cam.lastIp}:${cam.lastPort}",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
@@ -289,7 +289,7 @@ private fun CamerasPage(onOpenPairing: () -> Unit) {
                         }
                         RowIconAction(
                             MsIcon.TRASH,
-                            "解除配对",
+                            "移除记录",
                             onClick = { pendingUnpair = cam.peerDeviceId },
                             tint = MaterialTheme.colorScheme.error,
                         )
@@ -302,8 +302,8 @@ private fun CamerasPage(onOpenPairing: () -> Unit) {
     SettingsGroup {
         SettingsRow(
             index = 0, count = 1,
-            title = "配对新相机",
-            support = "输入配对码与相机配对",
+            title = "连接新相机",
+            support = "扫描并直接连接，无需配对码",
             leading = { IconCircle(MsIcon.ADD, IconTints.Accent) },
             trailing = { Chevron() },
             onClick = onOpenPairing,
@@ -568,7 +568,7 @@ private fun AboutPage(onNavigate: (SettingsPage) -> Unit) {
             //   取 IdentityRepo 落盘的那 16 位 hex 的**前 8 位** —— 与相机端那份"本机
             //   设备码"对仗，排障时两头各报一个码就能对上谁是谁。
             Text(
-                "本机设备码：${ConnectionCenter.shortCode(IdentityRepo.deviceId)}",
+                "连接方式：免配对直连",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -783,7 +783,7 @@ private fun SeedSwatch(color: Color, selected: Boolean, onClick: () -> Unit) {
 private val SeedNames = listOf("蓝", "紫", "绿", "琥珀")
 
 /**
- * 已配对相机的展示名：**相机型号 + SN**（用户定版）。
+ * 已连接过的相机的展示名：**相机型号 + SN**（用户定版）。
  *
  * 型号/SN 来自配对成功后立刻拉取的 `OP_DEVICE_INFO`；万一那次拉取失败，
  * 这里逐级回退到友好名、最后才是设备码 —— 总之不显示空白行。

@@ -2,6 +2,10 @@ package io.github.bi2qfa.alphasync.ui
 
 import android.graphics.Color as AndroidColor
 import android.os.Bundle
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import io.github.bi2qfa.alphasync.ui.screens.RemoteControlScreen
+import io.github.bi2qfa.alphasync.ui.screens.PhoneAlbumScreen
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -15,6 +19,10 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
@@ -31,12 +39,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import io.github.bi2qfa.alphasync.core.ConnectionCenter
+import io.github.bi2qfa.alphasync.data.SettingsRepo
 import io.github.bi2qfa.alphasync.data.PairingStore
 import io.github.bi2qfa.alphasync.transfer.DownloadService
 import io.github.bi2qfa.alphasync.ui.components.AppHeader
+import io.github.bi2qfa.alphasync.ui.components.MsIcon
 import io.github.bi2qfa.alphasync.ui.screens.CameraDetailScreen
 import io.github.bi2qfa.alphasync.ui.screens.FilesPagerScreen
 import io.github.bi2qfa.alphasync.ui.screens.HomeScreen
@@ -151,11 +163,14 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AppRoot() {
     val context = LocalContext.current
+    var showRemote by rememberSaveable { mutableStateOf(false) }
+    var showAlbum by rememberSaveable { mutableStateOf(false) }
+    var remoteAddress by rememberSaveable { mutableStateOf<String?>(null) }
     val state = ConnectionCenter.state
     // 配对表是 Compose 状态：配对/解除立刻让这里重组（决定进配对页还是主界面）
     val hasPaired = PairingStore.cameras.isNotEmpty()
     val connectedCamera = ConnectionCenter.camera
-    var tab by remember { mutableIntStateOf(0) }
+    var tab by rememberSaveable { mutableIntStateOf(0) }
     var showSettings by remember { mutableStateOf(false) }
     // 设置内部的页面栈（一级=入口列表，二级=具体设置项）。见 SettingsPage。
     var settingsPage by remember { mutableStateOf(SettingsPage.Hub) }
@@ -168,7 +183,9 @@ fun AppRoot() {
     // ★ 位置也要**按设备分开**记（隔离原则）：`/DCIM/100MSDCF` 这种路径两台相机上
     //   完全一样，记一份就会出现"切到 B 还停在 A 浏览的目录"，用户以为在看 B 的目录。
     val filesDirs = remember { mutableStateMapOf<String, String>() }
-    val filesDir = remember { mutableStateOf("/") }
+    val filesDir = remember {
+        mutableStateOf(SettingsRepo.lastDirectory())
+    }
     // ★ 第三批（§2）：文件/同步页的横向位置（0=文件页，1=同步页）——提升到根，
     //   跨"文件与同步 ↔ 传输"切换保留（FilesPagerScreen 切走即离开组合、pager 重建；
     //   本 compose 版库已无 PagerState.Saver，按方案退化路线提升到 AppRoot）。
@@ -176,20 +193,24 @@ fun AppRoot() {
     // ★ 2.11：双击顶栏标题 → 当前列表滚回顶部（文件页/同步页共用一个信号；传输页一个）。
     //   递增即触发；接收端只在 >0 时滚。
     var filesTopTick by remember { mutableIntStateOf(0) }
+    var filesRefreshTick by remember { mutableIntStateOf(0) }
     var transfersTopTick by remember { mutableIntStateOf(0) }
     val browsingGuid = ConnectionCenter.displayGuid().orEmpty()
     LaunchedEffect(browsingGuid) {
         filesDirs[browsingPreviousGuid] = filesDir.value   // 存下上一台的位置
-        filesDir.value = filesDirs[browsingGuid] ?: "/"    // 恢复这一台的位置
+        filesDir.value = filesDirs[browsingGuid] ?: SettingsRepo.lastDirectory(browsingGuid)    // 恢复这一台的位置
         browsingPreviousGuid = browsingGuid
     }
 
-    val pairingScreen = showPairing || !hasPaired
+    LaunchedEffect(ConnectionCenter.state) {
+        if (ConnectionCenter.state == ConnectionCenter.State.CONNECTED) showPairing = false
+    }
+    val pairingScreen = showPairing
 
     // 进软件自动连"上次最后连接过的那台"（用户定版）。hasPaired 变化时重跑：
     // 配好第一台（false→true）那一刻也会自动连上，不必让用户再点一次。
-    LaunchedEffect(hasPaired) {
-        if (hasPaired) ConnectionCenter.autoConnectLast(context)
+    LaunchedEffect(Unit) {
+        ConnectionCenter.autoConnectLast(context)
     }
 
     // 连接/配对成功（当前相机换成了一台）→ 自动回主界面（用户定版）。
@@ -290,7 +311,7 @@ fun AppRoot() {
     }
     val (pageTitle, onBack) = when {
         // 首次启动（一台都没配过）的配对页不给返回：这时候返回没有去处
-        pairingScreen -> "配对相机" to (if (hasPaired) ({ showPairing = false }) else null)
+        pairingScreen -> "连接相机" to (if (hasPaired) ({ showPairing = false }) else null)
         showCameraDetail -> "相机信息" to ({ showCameraDetail = false })
         showSettings -> settingsPage.title to (
             if (settingsPage == SettingsPage.Hub) ({ showSettings = false })
@@ -325,6 +346,59 @@ fun AppRoot() {
         // 主页那张卡会显示"正在连接 <那台>"直到连上/报错
         tab = 0
         ConnectionCenter.switchTo(context, guid)
+    }
+
+    fun openFilesFromRemote() {
+        if (screenKey != "tab1") pushCurrent()
+        showRemote = false
+        showPairing = false
+        showSettings = false
+        showCameraDetail = false
+        tab = 1
+        filesPagerPage.intValue = 0
+        filesRefreshTick++
+    }
+
+    fun openMainTab(index: Int) {
+        if (showRemote && index == 1) {
+            openFilesFromRemote()
+        } else {
+            showRemote = false
+            showAlbum = false
+            showPairing = false
+            tab = index
+        }
+    }
+
+    val navigation: @Composable () -> Unit = {
+        val showMainTab = !showAlbum && !showRemote
+        FloatingNav(
+            modifier = Modifier.fillMaxSize(),
+            actions = listOf(
+                NavItemSpec(MsIcon.NAV_HOME, "主界面", showMainTab && tab == 0) { openMainTab(0) },
+                NavItemSpec(MsIcon.NAV_FILES, "文件与同步", showMainTab && tab == 1) { openMainTab(1) },
+                NavItemSpec(MsIcon.NAV_TRANSFERS, "传输", showMainTab && tab == 2) { openMainTab(2) },
+                NavItemSpec(MsIcon.CAMERA, "遥控拍摄", showRemote) {
+                    showAlbum = false
+                    showRemote = true
+                },
+                NavItemSpec(MsIcon.IMAGE_PLACEHOLDER, "手机相册", showAlbum) {
+                    showRemote = false
+                    showAlbum = true
+                },
+            ),
+            onOpenSettings = {
+                showRemote = false
+                showAlbum = false
+                panelOpenSettings()
+            },
+            onSwitchDevice = { guid ->
+                showRemote = false
+                showAlbum = false
+                showPairing = false
+                panelSwitchDevice(guid)
+            },
+        )
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -429,6 +503,7 @@ fun AppRoot() {
                             dirState = filesDir,
                             topTick = filesTopTick,
                             pagerPage = filesPagerPage,
+                            refreshTick = filesRefreshTick,
                         )
                         else -> TransfersScreen(
                             onOpenSettings = panelOpenSettings,
@@ -440,19 +515,29 @@ fun AppRoot() {
             }
         }
 
-        // 覆盖在内容之上的悬浮导航（见上面的说明）。
-        // 条件从"已连接"放宽为"有配对设备"：未连接时用户更需要它 —— 面板里的
-        // "已绑定设备"是换一台相机重连的**唯一**入口（连接页已经不再是常驻页面了）。
-        // 相机详情页也不挂导航：它是从主页推进来的二级页，导航让位（与设置页一致）。
-        if (hasPaired && !showSettings && !showCameraDetail && !pairingScreen) {
-            FloatingNav(
-                // 铺满内容区：导航栏贴底、面板向上展开（内部各自对齐）
-                modifier = Modifier.fillMaxSize(),
-                tabIndex = tab,
-                onTab = { tab = it },
-                onOpenSettings = panelOpenSettings,
-                onSwitchDevice = panelSwitchDevice,
+        if (showRemote) {
+            RemoteControlScreen(
+                connectedAddress = remoteAddress,
+                onAddressChange = { remoteAddress = it },
+                onDismiss = {
+                    showRemote = false
+                    remoteAddress = null
+                },
+                onOpenFiles = { openFilesFromRemote() },
             )
+            navigation()
+        } else if (showAlbum) {
+            PhoneAlbumScreen(onDismiss = { showAlbum = false }, navigation = navigation)
+        } else if (hasPaired && !showSettings && !showCameraDetail && !pairingScreen) {
+            navigation()
+        } else if (!showSettings && !showCameraDetail) {
+            Row(
+                Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                TextButton(onClick = { showRemote = true }) { Text("遥控拍摄") }
+                TextButton(onClick = { showAlbum = true }) { Text("手机相册") }
+            }
         }
     }
 }

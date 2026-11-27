@@ -89,7 +89,7 @@ fun PairingScreen() {
             .verticalScroll(rememberScrollState())
             .padding(bottom = FloatingNavInset),
     ) {
-        SectionHeader("与相机配对")
+        SectionHeader("连接相机")
         SettingsGroup {
             SettingsRow(
                 index = 0, count = 1,
@@ -98,7 +98,7 @@ fun PairingScreen() {
                 // ★ 标题与提示文案按用户定版的新稿（提示**不许出现省略号**，
                 //   所以放宽 supportMaxLines 让整句折行显示完）
                 title = "确保相机端软件正常运行",
-                support = "相机端软件内无已配对设备时会自动进入配对模式，或者在选项菜单中点击「进入配对模式」",
+                support = "手机和相机连接同一网络，点击发现的相机即可连接，无需配对码",
                 supportMaxLines = 4,
                 leading = { IconCircle(MsIcon.CAMERA, IconTints.Accent) },
             )
@@ -108,7 +108,7 @@ fun PairingScreen() {
             // 扫描中：按钮内是 MD3E 的 LoadingIndicator（会动的多边形），文字**不再跟着闪点**
             // （用户定版：那三个点固定成 "..."，动的部分交给左边的指示器，别两处一起动）
             ExpressiveButton(
-                text = if (scanning) "扫描中..." else "扫描可配对相机",
+                text = if (scanning) "扫描中..." else "扫描相机",
                 onClick = { ConnectionCenter.startPairingScan(context, force = true) },
                 modifier = Modifier.fillMaxWidth(),
                 // ★ 扫描中**保持可点**（用户定版）：新扫描要求会终止老扫描重新开始，
@@ -151,7 +151,7 @@ fun PairingScreen() {
             GroupCard {
                 HintText(
                     if (scanning) "正在扫描同一网络下的相机…"
-                    else "没有找到相机，确认相机已进入「配对模式」，且手机与相机处于同一网络",
+                    else "没有找到相机，确认相机端软件已运行，且手机与相机处于同一网络",
                 )
             }
         } else {
@@ -161,10 +161,10 @@ fun PairingScreen() {
                         index = idx, count = results.size,
                         title = c.name.ifBlank { "AlphaSync 相机" },
                         // 用户定版：不再区分"这台相机绑定过手机"，只报地址与可配对状态
-                        support = "${c.host}:${c.protoPort} · 可配对",
+                        support = "${c.host}:${c.protoPort} · 点击连接",
                         leading = { IconCircle(MsIcon.CAMERA, IconTints.Accent) },
                         trailing = { Chevron() },
-                        onClick = { ConnectionCenter.requestPair(c) },
+                        onClick = { ConnectionCenter.connectTo(context, c) },
                     )
                 }
             }

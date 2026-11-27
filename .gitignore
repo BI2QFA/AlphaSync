@@ -41,3 +41,8 @@ __pycache__/
 *.keystore
 signing.properties
 keys/
+
+# Remote control web build
+node_modules/
+RemoteControl/web-client/dist/
+*.tsbuildinfo

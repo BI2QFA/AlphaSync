@@ -330,11 +330,20 @@ public final class ThumbnailExtractor {
         Session s = null;
         try {
             s = Session.open(f);
-            if (s == null) return null;
+            if (s == null) {
+                String name = f.getName().toLowerCase();
+                if (!name.endsWith(".jpg") && !name.endsWith(".jpeg")) return null;
+                byte[] fallback = jpgPreviewTailScan(f);
+                return fallback == null ? null : new PreviewBundle(fallback, "{}");
+            }
             byte[] jpg = extractPreviewFrom(s, f);
             if (jpg == null) return null;
-            return new PreviewBundle(jpg, exifJsonFrom(s.tiff));
+            String json;
+            try { json = exifJsonFrom(s.tiff); }
+            catch (Throwable ignored) { json = "{}"; }
+            return new PreviewBundle(jpg, json);
         } catch (Throwable t) {
+            AppLog.e("Preview", "大预览提取失败：" + f.getName(), t);
             return null;
         } finally {
             if (s != null) s.close();
@@ -378,6 +387,7 @@ public final class ThumbnailExtractor {
             }
         }
 
+        try {
         List cands2 = collectCandidates(s);
         Jpeg best2 = null;
         for (int i = 0; i < cands2.size(); i++) {
@@ -388,6 +398,10 @@ public final class ThumbnailExtractor {
         }
         if (best2 != null) return best2.data;
 
+        } catch (IOException ex) {
+            if (!isJpg) throw ex;
+            // An unreadable EXIF pointer must not suppress the independent JPG tail scan.
+        }
         if (isJpg) return jpgPreviewTailScan(f);
         return null;
     }
@@ -424,27 +438,33 @@ public final class ThumbnailExtractor {
             String n = f.getName().toLowerCase();
             if (n.endsWith(".arw")) {
                 RandomAccessFile raf = new RandomAccessFile(f, "r");
-                // 2.6：先把头 64KB 读进内存，合成 LayeredRegion（窗内走内存、越窗回落 RAF）
-                Region window = null;
+                boolean handedOff = false;
                 try {
-                    int headLen = (int) Math.min((long) ARW_HEAD_WINDOW, f.length());
-                    if (headLen > 0) {
-                        byte[] head = new byte[headLen];
-                        raf.readFully(head);
-                        window = new BufferRegion(head);
+                    // 2.6：先把头 64KB 读进内存，合成 LayeredRegion（窗内走内存、越窗回落 RAF）
+                    Region window = null;
+                    try {
+                        int headLen = (int) Math.min((long) ARW_HEAD_WINDOW, f.length());
+                        if (headLen > 0) {
+                            byte[] head = new byte[headLen];
+                            raf.readFully(head);
+                            window = new BufferRegion(head);
+                        }
+                    } catch (IOException e) {
+                        window = null;   // 读不到窗口 → 退回纯 RAF（功能不受影响，只是慢些）
                     }
-                } catch (IOException e) {
-                    window = null;   // 读不到窗口 → 退回纯 RAF（功能不受影响，只是慢些）
+                    Region region = window == null
+                            ? new RafRegion(raf)
+                            : new LayeredRegion(window, new RafRegion(raf));
+                    Tiff t = Tiff.open(region, 0L);
+                    if (t == null) {
+                        return null;
+                    }
+                    Session session = new Session(region, t, raf);
+                    handedOff = true;
+                    return session;
+                } finally {
+                    if (!handedOff) raf.close();
                 }
-                Region region = window == null
-                        ? new RafRegion(raf)
-                        : new LayeredRegion(window, new RafRegion(raf));
-                Tiff t = Tiff.open(region, 0L);
-                if (t == null) {
-                    raf.close();
-                    return null;
-                }
-                return new Session(region, t, raf);
             }
             if (n.endsWith(".jpg") || n.endsWith(".jpeg")) {
                 int len = (int) Math.min((long) HEAD_PARSE, f.length());
@@ -667,79 +687,118 @@ public final class ThumbnailExtractor {
      * 提取耗时 2451 → 902ms。
      */
     private static byte[] jpgPreviewTailScan(File f) throws IOException {
-        long size = f.length();
-        int window = (int) Math.min((long) TAIL_WINDOW, size);
-        RandomAccessFile raf = new RandomAccessFile(f, "r");
-        try {
-            byte[] buf = new byte[window];
-            raf.seek(size - window);
-            raf.readFully(buf);
-
-            // ① 一遍扫描：收集 SOI..EOI 跨度
-            int n = 0;
-            int[] starts = new int[MAX_IFDS];
-            int[] ends = new int[MAX_IFDS];
-            for (int i = 0; i + 4 <= window; i++) {
-                if ((buf[i] & 0xFF) != 0xFF || (buf[i + 1] & 0xFF) != 0xD8
-                        || (buf[i + 2] & 0xFF) != 0xFF) {
-                    continue;
-                }
-                int e = -1;
-                for (int j = i + 2; j + 2 <= window; j++) {
-                    if ((buf[j] & 0xFF) == 0xFF && (buf[j + 1] & 0xFF) == 0xD9) {
-                        e = j + 2;
-                        break;
-                    }
-                }
-                if (e < 0) continue;
-                if (n == starts.length) {
-                    // 候选比预估多：翻倍（尾部伪候选可能很多）
-                    int[] s2 = new int[n * 2];
-                    int[] e2 = new int[n * 2];
-                    System.arraycopy(starts, 0, s2, 0, n);
-                    System.arraycopy(ends, 0, e2, 0, n);
-                    starts = s2;
-                    ends = e2;
-                }
-                starts[n] = i;
-                ends[n] = e;
-                n++;
-            }
-            if (n == 0) return null;
-
-            // ② 按跨度降序
-            final int[] fStarts = starts;   // ★ Java 6：匿名类只能捕获 final（当年真实踩过的坑）
-            final int[] fEnds = ends;
-            Integer[] order = new Integer[n];
-            for (int i = 0; i < n; i++) order[i] = Integer.valueOf(i);
-            Arrays.sort(order, new Comparator<Integer>() {
-                public int compare(Integer a, Integer b) {
-                    return (fEnds[b.intValue()] - fStarts[b.intValue()])
-                            - (fEnds[a.intValue()] - fStarts[a.intValue()]);
-                }
-            });
-
-            // ③ 降序体检 + 剪枝
-            byte[] best = null;
-            for (int k = 0; k < n; k++) {
-                int idx = order[k].intValue();
-                int span = ends[idx] - starts[idx];
-                if (best != null && span <= best.length) break;
-                int[] dim = jpegScan(buf, starts[idx], window);
-                if (dim == null) continue;
-                int len = dim[2] - starts[idx];
-                if (len > (best == null ? 0 : best.length)) {
-                    byte[] out = new byte[len];
-                    System.arraycopy(buf, starts[idx], out, 0, len);
-                    best = out;
-                }
-            }
-            return best;
-        } finally {
-            raf.close();
+        // Keep the common 1 MB fast path. Grow only on a miss, with a bounded heap cost.
+        for (int window = TAIL_WINDOW; window <= 4 * TAIL_WINDOW; window *= 2) {
+            if (SHUTTING_DOWN) return null;
+            byte[] preview = jpgPreviewTailScanWindow(f, window);
+            if (preview != null) return preview;
+            if (f.length() <= window) break;
         }
+        return null;
     }
 
+    private static byte[] jpgPreviewTailScanWindow(File f, int requestedWindow) throws IOException {
+        long size = f.length();
+        int window = (int) Math.min((long) requestedWindow, size);
+        long base = size - window;
+        RandomAccessFile raf = new RandomAccessFile(f, "r");
+        try {
+            // A fixed 64 KiB scan buffer replaces the previous 1/2/4 MiB allocations.
+            byte[] buffer = new byte[64 * 1024];
+            int[] starts = new int[MAX_IFDS], ends = new int[MAX_IFDS];
+            int count = 0, position = 0, previous = -1, beforePrevious = -1;
+            raf.seek(base);
+            while (position < window) {
+                int bytes = Math.min(buffer.length, window - position);
+                raf.readFully(buffer, 0, bytes);
+                for (int k = 0; k < bytes; k++, position++) {
+                    int value = buffer[k] & 255;
+                    if (beforePrevious == 255 && previous == 216 && value == 255) {
+                        if (count == starts.length && count < 4096) {
+                            starts = Arrays.copyOf(starts, count * 2);
+                            ends = Arrays.copyOf(ends, count * 2);
+                        }
+                        if (count < starts.length) { starts[count] = position - 2; ends[count++] = -1; }
+                    }
+                    if (previous == 255 && value == 217) {
+                        for (int j = 0; j < count; j++) if (ends[j] < 0) ends[j] = position + 1;
+                    }
+                    beforePrevious = previous;
+                    previous = value;
+                }
+            }
+            final int[] candidateStarts = starts, candidateEnds = ends;
+            java.util.List<Integer> order = new java.util.ArrayList<Integer>();
+            for (int i = 0; i < count; i++) if (ends[i] >= 0) order.add(Integer.valueOf(i));
+            java.util.Collections.sort(order, new Comparator<Integer>() {
+                public int compare(Integer a, Integer b) {
+                    return (candidateEnds[b.intValue()] - candidateStarts[b.intValue()])
+                            - (candidateEnds[a.intValue()] - candidateStarts[a.intValue()]);
+                }
+            });
+            int bestLength = 0;
+            long bestStart = -1;
+            for (int k = 0; k < order.size(); k++) {
+                int index = order.get(k).intValue();
+                if (bestLength > 0 && ends[index] - starts[index] <= bestLength) break;
+                long start = base + starts[index];
+                long[] info = jpegScanFile(raf, start, size, buffer);
+                if (info == null || Math.max(info[0], info[1]) < BIG_PREVIEW_MIN_WIDTH) continue;
+                int length = (int) (info[2] - start);
+                if (length > bestLength) { bestStart = start; bestLength = length; }
+            }
+            if (bestStart < 0) return null;
+            byte[] preview = new byte[bestLength];
+            raf.seek(bestStart);
+            raf.readFully(preview);
+            return preview;
+        } finally { raf.close(); }
+    }
+
+    /** Same marker validation as jpegScan, using seeks and a reusable buffer rather than a whole tail. */
+    private static long[] jpegScanFile(RandomAccessFile raf, long start, long end, byte[] buffer) throws IOException {
+        raf.seek(start);
+        if (end - start < 4 || raf.readUnsignedShort() != 0xFFD8) return null;
+        long position = start + 2;
+        int width = -1, height = -1;
+        while (position + 4 <= end) {
+            raf.seek(position);
+            if (raf.readUnsignedByte() != 255) return null;
+            int marker = raf.readUnsignedByte();
+            if (marker == 255) { position++; continue; }
+            if (marker == 1 || marker >= 0xD0 && marker <= 0xD7 || marker == 0xD8) { position += 2; continue; }
+            if (marker == 0xD9) return width > 0 ? new long[]{width, height, position + 2} : null;
+            int length = raf.readUnsignedShort();
+            if (length < 2 || position + 2 + length > end) return null;
+            if (marker == 0xDA) {
+                position += 2 + length;
+                raf.seek(position);
+                boolean ff = false;
+                while (position < end) {
+                    int bytes = (int) Math.min(buffer.length, end - position);
+                    raf.readFully(buffer, 0, bytes);
+                    for (int k = 0; k < bytes; k++) {
+                        int value = buffer[k] & 255;
+                        if (ff) {
+                            if (value == 0xD9) return width > 0 ? new long[]{width, height, position + k + 1} : null;
+                            if (value == 255) continue;
+                            if (value != 0 && !(value >= 0xD0 && value <= 0xD7)) return null;
+                            ff = false;
+                        } else { ff = value == 255; }
+                    }
+                    position += bytes;
+                }
+                return null;
+            }
+            if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+                if (position + 9 >= end) return null;
+                raf.seek(position + 5);
+                height = raf.readUnsignedShort(); width = raf.readUnsignedShort();
+            }
+            position += 2 + length;
+        }
+        return null;
+    }
     // ===== EXIF 信息兜底 =====
 
     private static ExifInfo readInfoFrom(Tiff t) throws IOException {

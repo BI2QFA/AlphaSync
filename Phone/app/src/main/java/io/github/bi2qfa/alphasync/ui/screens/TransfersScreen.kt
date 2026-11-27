@@ -341,7 +341,8 @@ fun TransfersScreen(
                                     // "点此打开"也早就是点击即打开，不需要再教。
                                     // ★ 这一行给已完成项写**源文件的修改时间**（用户要求：传完的
                                     //   文件在文件名下方要有修改时间）；还没传完的项仍写状态字。
-                                    val label = stateLabel(item)
+                                    val label = if (item.state == TransferState.FAILED && item.error.isNotBlank())
+                                        "失败：${item.error}" else stateLabel(item)
                                     val sub = if (label.isNotBlank()) label
                                     else if (item.mtime > 0) formatMtime(item.mtime) else ""
                                     if (sub.isNotBlank()) {
@@ -603,8 +604,8 @@ private fun StatChip(label: String, count: Int) {    androidx.compose.material3.
  * 左边那枚绿底对号 + 满格进度条已经把"传完了"说清楚，不需要再写一遍。
  */
 private fun stateLabel(item: TransferItem): String = when (item.state) {
-    TransferState.QUEUED -> "等待传输"
-    TransferState.RUNNING -> "传输中"
+    TransferState.QUEUED -> if (item.priorityDownload) "优先下载 · 等待传输" else "正常下载 · 等待传输"
+    TransferState.RUNNING -> if (item.priorityDownload) "优先下载中" else if (io.github.bi2qfa.alphasync.data.ThumbStore.downloadWaitingForPreview) "已暂停下载，优先加载预览" else "传输中"
     TransferState.DONE -> ""
     TransferState.FAILED -> "失败（开始传输时自动续传）"
 }
